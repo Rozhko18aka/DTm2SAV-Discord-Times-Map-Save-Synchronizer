@@ -147,7 +147,7 @@ Format/runtime hardening
 Automated tests
 ===============
 
-Current automated result: 105/105 tests PASS.
+Current automated result: 115/115 tests PASS.
 The suite additionally contains:
 - 2000 seeded exact-survivor alignment fuzz iterations;
 - 500 seeded structural alignment fuzz iterations;
@@ -188,5 +188,25 @@ LIVE GAME-DATA V6
 - Runtime calculations use those live files. army_catalog.json is comparison/reference data only.
 - Gameplay parameter differences show a non-blocking warning; affected exact profiles are not reused and formula fallback is permitted.
 - Sync JSON records source paths and SHA-256 hashes.
-- v6 automated suite: 105/105 PASS.
+- v6.1 automated suite: 106/106 PASS.
+- v6.2 automated suite: 108/108 PASS.
 - All six available v5 end-to-end outputs remain byte-identical under the unchanged embedded reference catalog.
+
+
+BUILDING/DECOR OVERLAP V6.2
+============================
+- Native control: Другой берег -> Другой берег7.
+- Target DTm removes 52 decorations and appends 2 buildings.
+- Generated compiled-grid matches native Другой берег7.sav byte-for-byte: 0 diff across the 1,520,000-byte grid.
+- Native building collision/property layer is C/A/B = 3/6/3 on every building navigation cell; independently confirmed on 1816 cells in the source SAV.
+- Some Town pictures have navigation cells outside the DTm size_x/size_y rectangle. DTm2SAV learns connected extra cells from the source SAV by picture/type/size signature and reuses them for matching new buildings.
+- New building placement no longer leaves decoration-derived passability under the building. Deleting/moving a building reconstructs affected C/A/B cells from modified terrain + modified decorations before applying target building collision.
+- Shoreline control: all building attached runtime states match native; remaining Building core differences are known volatile/opaque independent-load bytes.
+
+POST-REVIEW BUILDING FIXES (2026-09-20)
+========================================
+- Fixed compiled-grid invalidation when picture_number, picture_variant or building_type changes without x/y or size changes.
+- Restored building_additions GUI/report rows from structural target->source mapping.
+- Navigation profile inference now records observed rectangular signatures as known empty-extra profiles; unseen signatures are reported explicitly.
+- Fresh buildings without a same-type runtime-core template are reported explicitly instead of being indistinguishable from byte-certified cases.
+- Added 7 regression tests; pytest result 115 passed + 161 subtests.

@@ -154,20 +154,28 @@ def parse_building_record(raw: bytes) -> BuildingRecord:
 
 
 def expected_navigation_owners(
-    records: Iterable[BuildingRecord], row_stride: int
+    records: Iterable[BuildingRecord],
+    row_stride: int,
+    footprints: Iterable[set[tuple[int, int]]] | None = None,
 ) -> dict[tuple[int, int], tuple[int, int]]:
-    """Return native field+5 ownership for building footprints.
+    """Return native field+5 ownership for building navigation footprints.
 
     MapLDV V.4 permits overlapping building footprints.  The compiled-grid
     navigation cell is owned by the later BuildingData record, while field +1
-    at each anchor remains the building's own ID.  The supplied large shoreline
-    native save proves this precedence rule (#108 overlapped by later #158).
-    Values are ``(anchor_linear_index, one_based_building_id)``.
+    at each anchor remains the building's own ID.  Some building pictures have
+    a navigation footprint that is slightly larger than ``size_x/size_y``; an
+    optional ``footprints`` iterable lets the caller supply native-observed
+    footprints for those pictures.  Values are
+    ``(anchor_linear_index, one_based_building_id)``.
     """
+    records = list(records)
+    fp_list = list(footprints) if footprints is not None else [r.footprint for r in records]
+    if len(fp_list) != len(records):
+        raise ValueError("footprint count must match building count")
     out: dict[tuple[int, int], tuple[int, int]] = {}
-    for building_id, record in enumerate(records, 1):
+    for building_id, (record, footprint) in enumerate(zip(records, fp_list), 1):
         anchor = record.x + row_stride * record.y
-        for cell in record.footprint:
+        for cell in footprint:
             out[cell] = (anchor, building_id)
     return out
 
@@ -882,10 +890,17 @@ def build_runtime_blob(
     parts: list[bytes] = []
     approximated_markets: list[int] = []
     garrison_rebuilds: list[int] = []
+    missing_fresh_templates: list[int] = []
     for target, new_record in enumerate(new_records):
         source = mapping[target] if target < len(mapping) else None
         if source is None:
             template_core = choose_template_core(new_record, old_records, source_entries)
+            if template_core is None:
+                # This remains an explicitly reported fallback.  Native all-type
+                # controls prove fresh empty buildings can be synthesized, but
+                # their opaque core bytes are not byte-certified for every
+                # picture/type combination, so do not hide the missing template.
+                missing_fresh_templates.append(target + 1)
             core, approx = synthesize_core(new_record, catalog, template_core=template_core)
             state = synthesize_garrison_state(new_record, catalog, strict=strict) if new_record.runtime_garrison else b""
             if state:
@@ -933,4 +948,5 @@ def build_runtime_blob(
     return b"".join(parts), {
         "market_runtime_rng_approximated_building_ids": approximated_markets,
         "garrison_rebuilt_building_ids": garrison_rebuilds,
+        "fresh_building_runtime_template_missing_ids": missing_fresh_templates,
     }

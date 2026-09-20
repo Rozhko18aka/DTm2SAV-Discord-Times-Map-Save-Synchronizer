@@ -1,0 +1,495 @@
+--- /mnt/data/dtm2sav_review/dtm_sav_quest_sync.py	2026-09-20 17:11:36.000000000 +0000
++++ /mnt/data/dtm2sav_fixed/dtm_sav_quest_sync.py	2026-09-20 18:47:32.322515991 +0000
+@@ -187,8 +187,9 @@
+     coordinate_template_index: int | None
+     runtime_state_added: bool
+     pointer_template_index: int | None
+-    core: bytes
+-    state: bytes
++    core: bytes = b""
++    state: bytes = b""
++    serialized_size: int | None = None
+ 
+     def as_dict(self) -> dict[str, Any]:
+         return {
+@@ -208,7 +209,11 @@
+                 self.pointer_template_index + 1
+                 if self.pointer_template_index is not None else None
+             ),
+-            "serialized_size": len(self.core) + len(self.state),
++            "serialized_size": (
++                self.serialized_size
++                if self.serialized_size is not None
++                else len(self.core) + len(self.state)
++            ),
+         }
+ 
+ 
+@@ -344,6 +349,8 @@
+     objects_ugs: Path | None
+     hero_replacement: bytes | None
+     building_additions: list[BuildingAddition]
++    building_navigation_unseen_profile_ids: list[int]
++    building_runtime_template_missing_ids: list[int]
+     lantern_additions: list[LanternAddition]
+     lantern_records: list[LanternAddition]
+     lantern_rewrite: bool
+@@ -1060,6 +1067,70 @@
+     )
+ 
+ 
++def _building_grid_semantics_changed(old_raw: bytes, new_raw: bytes) -> bool:
++    """Return whether a BuildingData edit can change compiled-grid occupancy.
++
++    Navigation footprint is keyed by picture variant/number, building type and
++    nominal size in addition to the DTm anchor coordinates.  Comparing only
++    x/y and size_x/size_y leaves stale field+5/property cells when an editor
++    swaps the building picture or type without moving/resizing it.
++    """
++    if len(old_raw) != BUILDING_SIZE or len(new_raw) != BUILDING_SIZE:
++        raise ValueError("BuildingData record must be 358 bytes")
++    if old_raw[:4] != new_raw[:4]:
++        return True
++    for off in (
++        building_runtime.PICTURE_NUMBER_OFF,
++        building_runtime.PICTURE_VARIANT_OFF,
++        building_runtime.TYPE_OFF,
++        building_runtime.SIZE_X_OFF,
++        building_runtime.SIZE_Y_OFF,
++    ):
++        if old_raw[off] != new_raw[off]:
++            return True
++    return False
++
++
++def _building_addition_report(
++    target_index: int,
++    raw: bytes,
++) -> BuildingAddition:
++    """Create the legacy GUI/report row from the active runtime path."""
++    record = building_runtime.parse_building_record(raw)
++    save_x, save_y = record.runtime_coords
++    state_size = (
++        building_runtime.RUNTIME_GARRISON_SIZE if record.runtime_garrison else 0
++    )
++    return BuildingAddition(
++        index=target_index,
++        building_type=record.building_type,
++        picture_number=record.picture_number,
++        picture_variant=record.picture_variant,
++        raw_x=record.x,
++        raw_y=record.y,
++        save_x=save_x,
++        save_y=save_y,
++        coordinate_template_index=None,
++        runtime_state_added=record.runtime_garrison,
++        pointer_template_index=None,
++        core=b"",
++        state=b"",
++        serialized_size=building_runtime.BUILDING_SIZE + state_size,
++    )
++
++
++def _building_additions_from_mapping(
++    mapping: list[int | None],
++    new_raw_records: list[bytes],
++) -> list[BuildingAddition]:
++    """Return report/GUI rows for structurally new target buildings."""
++    return [
++        _building_addition_report(target, new_raw_records[target])
++        for target, source in enumerate(mapping)
++        if source is None
++    ]
++
++
+ def infer_building_navigation_profiles(
+     payload: bytes,
+     relationship: dict[str, Any],
+@@ -1119,8 +1190,11 @@
+                 if 0 <= cell[0] < width and 0 <= cell[1] < height:
+                     queued.add(cell)
+                     frontier.append(cell)
+-        if extras:
+-            profiles.setdefault(_building_navigation_profile_key(record), set()).update(extras)
++        key = _building_navigation_profile_key(record)
++        # Presence of an empty set is meaningful: this exact signature was
++        # observed in the source SAV and its native footprint was rectangular.
++        # Missing keys are the only cases using the unseen-picture fallback.
++        profiles.setdefault(key, set()).update(extras)
+     return profiles
+ 
+ 
+@@ -1602,13 +1676,17 @@
+     )
+     building_grid_semantics_changed = building_structure_changed or any(
+         source is None
+-        or old_building_records[source][:4] != new_building_records[target][:4]
+-        or old_building_records[source][building_runtime.SIZE_X_OFF:building_runtime.SIZE_Y_OFF + 1]
+-           != new_building_records[target][building_runtime.SIZE_X_OFF:building_runtime.SIZE_Y_OFF + 1]
++        or _building_grid_semantics_changed(
++            old_building_records[source], new_building_records[target]
++        )
+         for target, source in enumerate(building_mapping)
+     )
+-    # Legacy append-only report field retained for backward-compatible JSON.
+-    building_additions: list[BuildingAddition] = []
++    # Keep the legacy GUI/report field populated from the active structural
++    # mapping.  Runtime construction itself is handled later by
++    # building_runtime.build_runtime_blob().
++    building_additions = _building_additions_from_mapping(
++        building_mapping, new_building_records
++    )
+     (
+         lantern_additions,
+         lantern_records,
+@@ -1626,6 +1704,33 @@
+     cell_table_base_u16, cell_table_stride = infer_cell_table(
+         payload, original, original_sections, relationship
+     )
++    parsed_old_buildings = [
++        building_runtime.parse_building_record(raw) for raw in old_building_records
++    ]
++    parsed_new_buildings = [
++        building_runtime.parse_building_record(raw) for raw in new_building_records
++    ]
++    observed_navigation_profiles = infer_building_navigation_profiles(
++        payload,
++        relationship,
++        parsed_old_buildings,
++        cell_table_base_u16,
++        cell_table_stride,
++        width,
++        height,
++    )
++    building_navigation_unseen_profile_ids = [
++        index + 1
++        for index, record in enumerate(parsed_new_buildings)
++        if _building_navigation_profile_key(record) not in observed_navigation_profiles
++    ]
++    source_building_types = {record.building_type for record in parsed_old_buildings}
++    building_runtime_template_missing_ids = [
++        target + 1
++        for target, source in enumerate(building_mapping)
++        if source is None
++        and parsed_new_buildings[target].building_type not in source_building_types
++    ]
+     cell_layer_u16_count = relationship["compiled_grid"]["cell_layers_size"] // 2
+     (
+         property_ring_size_u16,
+@@ -1801,6 +1906,8 @@
+         objects_ugs=resolved_objects_ugs,
+         hero_replacement=hero_replacement,
+         building_additions=building_additions,
++        building_navigation_unseen_profile_ids=building_navigation_unseen_profile_ids,
++        building_runtime_template_missing_ids=building_runtime_template_missing_ids,
+         lantern_additions=lantern_additions,
+         lantern_records=lantern_records,
+         lantern_rewrite=lantern_rewrite,
+@@ -1849,8 +1956,14 @@
+         ],
+         "deleted_source_building_ids": [index + 1 for index in plan.building_deleted_indices],
+         # Backward-compatible aliases retained for older GUI/report readers.
+-        "appended_building_count": sum(source is None for source in plan.building_mapping),
+-        "appended_buildings": [],
++        "appended_building_count": len(plan.building_additions),
++        "appended_buildings": [item.as_dict() for item in plan.building_additions],
++        "building_navigation_unseen_profile_ids": list(
++            plan.building_navigation_unseen_profile_ids
++        ),
++        "building_runtime_template_missing_ids": list(
++            plan.building_runtime_template_missing_ids
++        ),
+         "source_army_count": plan.army_count,
+         "modified_army_count": plan.modified_army_count,
+         "changed_army_count": len(plan.army_changes),
+@@ -1937,9 +2050,9 @@
+     deleted_building_ids = {index + 1 for index in building_deleted_indices}
+     building_grid_changed = plan.building_structure_changed or any(
+         source is None
+-        or old_building_records[source].raw[:4] != new_building_records[target].raw[:4]
+-        or old_building_records[source].raw[building_runtime.SIZE_X_OFF:building_runtime.SIZE_Y_OFF + 1]
+-           != new_building_records[target].raw[building_runtime.SIZE_X_OFF:building_runtime.SIZE_Y_OFF + 1]
++        or _building_grid_semantics_changed(
++            old_building_records[source].raw, new_building_records[target].raw
++        )
+         for target, source in enumerate(building_mapping)
+     )
+ 
+@@ -2161,6 +2274,11 @@
+         building_navigation_footprint(record, building_navigation_profiles)
+         for record in new_building_records
+     ]
++    building_navigation_unseen_profile_ids = [
++        index + 1
++        for index, record in enumerate(new_building_records)
++        if _building_navigation_profile_key(record) not in building_navigation_profiles
++    ]
+ 
+     # Army occupancy markers live in cell fields 3/4.  Structural army-ID
+     # changes must be applied even when an army has moved during gameplay.
+@@ -2823,6 +2941,12 @@
+             "building_navigation_extra_cell_count": sum(
+                 len(cells) for cells in building_navigation_profiles.values()
+             ),
++            "building_navigation_unseen_profile_building_ids": (
++                building_navigation_unseen_profile_ids
++            ),
++            "building_navigation_uses_rectangular_fallback": bool(
++                building_navigation_unseen_profile_ids
++            ),
+             "decoration_property_write_count": decoration_property_writes,
+             "decoration_visual_write_count": decoration_visual_writes,
+             "decoration_visual_values_are_experimental": bool(
+--- /mnt/data/dtm2sav_review/building_runtime.py	2026-09-20 17:08:24.000000000 +0000
++++ /mnt/data/dtm2sav_fixed/building_runtime.py	2026-09-20 18:46:04.819278981 +0000
+@@ -890,10 +890,17 @@
+     parts: list[bytes] = []
+     approximated_markets: list[int] = []
+     garrison_rebuilds: list[int] = []
++    missing_fresh_templates: list[int] = []
+     for target, new_record in enumerate(new_records):
+         source = mapping[target] if target < len(mapping) else None
+         if source is None:
+             template_core = choose_template_core(new_record, old_records, source_entries)
++            if template_core is None:
++                # This remains an explicitly reported fallback.  Native all-type
++                # controls prove fresh empty buildings can be synthesized, but
++                # their opaque core bytes are not byte-certified for every
++                # picture/type combination, so do not hide the missing template.
++                missing_fresh_templates.append(target + 1)
+             core, approx = synthesize_core(new_record, catalog, template_core=template_core)
+             state = synthesize_garrison_state(new_record, catalog, strict=strict) if new_record.runtime_garrison else b""
+             if state:
+@@ -941,4 +948,5 @@
+     return b"".join(parts), {
+         "market_runtime_rng_approximated_building_ids": approximated_markets,
+         "garrison_rebuilt_building_ids": garrison_rebuilds,
++        "fresh_building_runtime_template_missing_ids": missing_fresh_templates,
+     }
+--- /mnt/data/dtm2sav_review/army_runtime.py	2026-09-20 15:32:28.000000000 +0000
++++ /mnt/data/dtm2sav_fixed/army_runtime.py	2026-09-20 18:51:31.368614430 +0000
+@@ -731,12 +731,26 @@
+ 
+ 
+ def _catalog_cost_recruit_div(catalog:dict):
+-    """Read optional _Global.ini-derived divisor from catalog; default is 2."""
++    """Read and normalize optional _Global.ini-derived divisor.
++
++    Live ``_Global.ini`` values are parsed as strings by ``game_resources``.
++    Keep the normalization here so every runtime caller receives a numeric
++    divisor, including building garrison synthesis.  Invalid/non-positive
++    values fall back to the native default 2.
++    """
++    raw = 2
+     for key in ('_global','global','Global'):
+         d=catalog.get(key)
+         if isinstance(d,dict) and 'CostRecruitDiv' in d:
+-            return d.get('CostRecruitDiv')
+-    return 2
++            raw = d.get('CostRecruitDiv')
++            break
++    try:
++        value = float(raw)
++    except (TypeError, ValueError):
++        value = 2.0
++    if not math.isfinite(value) or value <= 0.0:
++        value = 2.0
++    return value
+ 
+ 
+ def _bonus_for(unit:dict, items:list[dict]):
+--- /mnt/data/dtm2sav_review/dtm_to_sav_gui.py	2026-09-20 15:35:26.000000000 +0000
++++ /mnt/data/dtm2sav_fixed/dtm_to_sav_gui.py	2026-09-20 18:46:36.581473312 +0000
+@@ -693,6 +693,8 @@
+                 f"Клеток ландшафта: {len(plan.terrain_changes)}. "
+                 f"Изменено армий: {len(plan.army_changes)}. "
+                 f"Новых строений: {len(plan.building_additions)}. "
++                f"Неизвестных native-footprint профилей: {len(plan.building_navigation_unseen_profile_ids)}. "
++                f"Новых строений без runtime-core шаблона: {len(plan.building_runtime_template_missing_ids)}. "
+                 f"Новых Фонарь/Events: {len(plan.lantern_additions)}. "
+                 f"Изменено Фонарь/Events: {len(plan.lantern_changed_ids)}. "
+                 f"Удалено Фонарь/Events: {len(plan.lantern_removed_ids)}. "
+@@ -719,6 +721,20 @@
+             if plan.building_additions:
+                 ids = ", ".join(str(item.index + 1) for item in plan.building_additions)
+                 self._log(f"Будут добавлены строения: {ids}.")
++            if plan.building_navigation_unseen_profile_ids:
++                ids = ", ".join(map(str, plan.building_navigation_unseen_profile_ids))
++                self._log(
++                    "ВНИМАНИЕ: для строений ID " + ids
++                    + " exact navigation-footprint не наблюдался в исходном SAV; "
++                      "будет использован прямоугольный fallback size_x×size_y."
++                )
++            if plan.building_runtime_template_missing_ids:
++                ids = ", ".join(map(str, plan.building_runtime_template_missing_ids))
++                self._log(
++                    "ВНИМАНИЕ: для новых строений ID " + ids
++                    + " нет runtime-core шаблона того же типа в исходном SAV; "
++                      "opaque bytes не считаются byte-certified."
++                )
+             if plan.lantern_additions:
+                 ids = ", ".join(str(item.lantern_id) for item in plan.lantern_additions)
+                 self._log(f"Будут добавлены Фонарь/Events: {ids}.")
+@@ -756,6 +772,8 @@
+                     f"Будет изменено клеток ландшафта: {len(plan.terrain_changes)}.\n"
+                     f"Будет синхронизировано армий: {len(plan.army_changes)}.\n"
+                     f"Будет добавлено строений: {len(plan.building_additions)}.\n"
++                    f"Footprint fallback: {len(plan.building_navigation_unseen_profile_ids)} строений.\n"
++                    f"Без runtime-core шаблона: {len(plan.building_runtime_template_missing_ids)} строений.\n"
+                     f"Будет добавлено Фонарь/Events: {len(plan.lantern_additions)}.\n"
+                     f"Будет изменено Фонарь/Events: {len(plan.lantern_changed_ids)}.\n"
+                     f"Будет удалено Фонарь/Events: {len(plan.lantern_removed_ids)}.\n"
+--- /mnt/data/dtm2sav_review/tests/test_building_runtime.py	2026-09-20 17:11:52.000000000 +0000
++++ /mnt/data/dtm2sav_fixed/tests/test_building_runtime.py	2026-09-20 18:51:31.368783814 +0000
+@@ -1,3 +1,4 @@
++import copy
+ import hashlib
+ import struct
+ import unittest
+@@ -91,11 +92,29 @@
+         profiles = qs.infer_building_navigation_profiles(
+             bytes(payload), relationship, [rec], base, stride, width, height
+         )
++        self.assertIn(qs._building_navigation_profile_key(rec), profiles)
+         footprint = qs.building_navigation_footprint(rec, profiles)
+         self.assertEqual(len(footprint), 9)
+         self.assertTrue({(3,3), (4,3), (5,3)} <= footprint)
+         self.assertNotIn((0,0), footprint)
+ 
++    def test_native_navigation_profile_records_rectangular_observation(self):
++        rec = br.parse_building_record(raw_building(x=5, y=5, sx=2, sy=2, typ=1))
++        width = height = 10
++        stride = 12
++        base = 20
++        payload = bytearray((base + 9 * stride * height + 16) * 2)
++        anchor = rec.x + stride * rec.y
++        for x, y in rec.footprint:
++            struct.pack_into('<H', payload, 2 * (base + 9 * (x + stride * y) + 5), anchor)
++        relationship = {'compiled_grid': {'offset': 0, 'cell_layers_size': len(payload)}}
++        profiles = qs.infer_building_navigation_profiles(
++            bytes(payload), relationship, [rec], base, stride, width, height
++        )
++        key = qs._building_navigation_profile_key(rec)
++        self.assertIn(key, profiles)
++        self.assertEqual(profiles[key], set())
++
+     def test_expected_navigation_accepts_native_footprint_override(self):
+         r = br.parse_building_record(raw_building(x=5, y=5, sx=2, sy=2))
+         footprint = set(r.footprint) | {(4, 3), (5, 3)}
+@@ -156,6 +175,24 @@
+             self.assertEqual(hashlib.sha256(state).hexdigest(), expected)
+             self.assertEqual(br.verify_garrison_state(rec, state, self.catalog), [])
+ 
++    def test_live_global_string_cost_recruit_div_is_accepted(self):
++        # game_resources preserves _Global.ini spelling as a string.  Fresh
++        # Town/Castle/Fort/Ruins synthesis must normalize it before division.
++        live_catalog = copy.deepcopy(self.catalog)
++        live_catalog['_global'] = {'CostRecruitDiv': '2'}
++        rec = br.parse_building_record(
++            raw_building(typ=3, defence=15, garrison=[(8, 0, 1)])
++        )
++        expected = br.synthesize_garrison_state(rec, self.catalog, strict=True)
++        actual = br.synthesize_garrison_state(rec, live_catalog, strict=True)
++        self.assertEqual(actual, expected)
++        self.assertEqual(army_runtime._catalog_cost_recruit_div(live_catalog), 2.0)
++
++    def test_invalid_live_global_cost_recruit_div_falls_back_to_two(self):
++        for raw in ('', '0', '-3', 'nan', 'bad', None):
++            catalog = {'_global': {'CostRecruitDiv': raw}}
++            self.assertEqual(army_runtime._catalog_cost_recruit_div(catalog), 2.0)
++
+     def test_verifier_catches_strength_corruption(self):
+         rec = br.parse_building_record(raw_building(typ=3, defence=15, garrison=[(8,0,1)]))
+         state = bytearray(br.synthesize_garrison_state(rec, self.catalog, strict=True))
+@@ -254,5 +291,40 @@
+         self.assertEqual(out[2*army_runtime.RUNTIME_ARMY_SIZE + army_runtime.START_BUILDING_OFF], 9)
+ 
+ 
++
++
++class TestFreshBuildingSafety(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.catalog = army_runtime.load_catalog()
++
++    def test_strict_runtime_build_reports_missing_template_without_hiding_it(self):
++        relationship = {
++            'buildings': {
++                'record_offsets': [],
++                'runtime_garrison_building_indices': [],
++            }
++        }
++        new = raw_building(typ=6)
++        blob, report = br.build_runtime_blob(
++            b'', relationship, [], [new], [None], self.catalog, strict=True
++        )
++        self.assertEqual(len(blob), br.BUILDING_SIZE)
++        self.assertEqual(report['fresh_building_runtime_template_missing_ids'], [1])
++
++    def test_non_strict_runtime_build_reports_missing_template(self):
++        relationship = {
++            'buildings': {
++                'record_offsets': [],
++                'runtime_garrison_building_indices': [],
++            }
++        }
++        new = raw_building(typ=6)
++        blob, report = br.build_runtime_blob(
++            b'', relationship, [], [new], [None], self.catalog, strict=False
++        )
++        self.assertEqual(len(blob), br.BUILDING_SIZE)
++        self.assertEqual(report['fresh_building_runtime_template_missing_ids'], [1])
+ if __name__ == '__main__':
+     unittest.main()
++
+--- /mnt/data/dtm2sav_review/tests/test_quest_sync_layout.py	2026-09-20 11:04:00.000000000 +0000
++++ /mnt/data/dtm2sav_fixed/tests/test_quest_sync_layout.py	2026-09-20 18:47:32.322687228 +0000
+@@ -33,5 +33,48 @@
+             qs.infer_cell_table(*empty_case(150, 150))
+ 
+ 
++
++
++class TestBuildingGridSemantics(unittest.TestCase):
++    @staticmethod
++    def _raw(*, x=5, y=5, picture=0, variant=0, typ=1, sx=2, sy=2):
++        raw = bytearray(qs.BUILDING_SIZE)
++        struct.pack_into('<HH', raw, 0, x, y)
++        raw[4] = picture
++        raw[5] = variant
++        raw[6] = typ
++        raw[289] = sx
++        raw[290] = sy
++        return bytes(raw)
++
++    def test_picture_change_requires_grid_rebuild(self):
++        old = self._raw(picture=1, variant=0)
++        new = self._raw(picture=1, variant=1)
++        self.assertTrue(qs._building_grid_semantics_changed(old, new))
++
++    def test_type_change_requires_grid_rebuild(self):
++        old = self._raw(typ=1)
++        new = self._raw(typ=3)
++        self.assertTrue(qs._building_grid_semantics_changed(old, new))
++
++    def test_unrelated_building_byte_does_not_require_grid_rebuild(self):
++        old = bytearray(self._raw())
++        new = bytearray(old)
++        new[337] = 2  # group: semantic runtime change, not footprint geometry
++        self.assertFalse(qs._building_grid_semantics_changed(bytes(old), bytes(new)))
++
++    def test_building_addition_report_uses_structural_mapping(self):
++        existing = self._raw(x=5, y=5, typ=1, sx=2, sy=2)
++        added = self._raw(x=10, y=9, typ=3, sx=3, sy=2)
++        rows = qs._building_additions_from_mapping([0, None], [existing, added])
++        self.assertEqual(len(rows), 1)
++        self.assertEqual(rows[0].index, 1)
++        self.assertEqual((rows[0].save_x, rows[0].save_y), (8, 8))
++        self.assertTrue(rows[0].runtime_state_added)
++        self.assertEqual(
++            rows[0].as_dict()['serialized_size'],
++            qs.BUILDING_SIZE + qs.building_runtime.RUNTIME_GARRISON_SIZE,
++        )
+ if __name__ == "__main__":
+     unittest.main()
++

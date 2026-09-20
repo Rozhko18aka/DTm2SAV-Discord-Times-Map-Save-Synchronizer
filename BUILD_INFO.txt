@@ -1,32 +1,30 @@
-Discord Times QuestSync - live game-data support v6
+DTm2SAV - live game-data + building/decor overlap support v6.2
 Date: 2026-09-20
 
 Startup game-data loading
 - Required beside the application: Rus_Units.ini, Rus_Artefacts.ini, Rus_Spells.ini, _Global.ini
 - Required fixed subpath: Graphics\Objects\Objects.ugs
 - Missing/unreadable required data is fatal before the main GUI opens
-- Duplicate Rus_Spells.ini sections are preserved in source order, so positional spell IDs do not shift
-- Active runtime calculations use the live game files, not army_catalog.json
-- army_catalog.json remains the tested reference profile only
-- Changed gameplay parameters trigger a non-blocking "native testing not performed" warning
-- Exact native profiles are disabled only for affected changed unit/artifact/spell combinations; formula fallback is allowed so saving remains possible
-- JSON sync reports include loaded game-data paths, SHA-256 hashes and compatibility-difference IDs
+- Active runtime calculations use the live game files; army_catalog.json is the tested reference profile
+- Changed gameplay parameters trigger a non-blocking native-testing warning and remain saveable
 
-Core support retained from v5
+Core support
 - MapLDV V.4 event/terrain/decor/lantern sync
-- Army add/edit/delete/insert/reorder, max 12 units, artifacts/spells, tactical strength/upkeep, native reference remap
-- Building add/edit/delete/insert/reorder
-- Garrisons, barracks, markets and shrine/church spells
-- Strict runtime/reference/grid verifiers and native overlapping-footprint rule
+- Army add/edit/delete/insert/reorder, max 12 units, artifacts/spells, tactical strength/upkeep, reference remap
+- Building add/edit/delete/insert/reorder; garrisons, barracks, markets and shrine/church spells
+- Building placement/removal rebuilds hidden C/A/B property layers and compiled navigation
+- Native navigation-footprint extensions are learned from source SAV by building picture/type/size signature
+- Strict runtime/reference/grid verifiers
 
 Validation
-- Automated tests: 105/105 PASS
+- Automated tests: 115/115 PASS (post-review; native v6.2 snapshot remains 108/108)
 - Python compile: PASS
 - GUI import: PASS
-- Six v5 native regression outputs are byte-identical to the v5 release outputs
 - New.DTm/New.sav no-op SHA-256 unchanged: 64260ac4aeaef978031b055dfed315e1c97f0134226149f42cfae6c4f9a2e1b8
 - Objects no-op unchanged: de30db63c56e561d4407066ac0e225ed77516fdbc735eab32eac5d8f92adebd7
 - Objects2 no-op unchanged: ff918ec879f849cf08b4b87cf797fd070601cbc2b896f5ce5c95d7ce3d54cf55
 - Objects -> Objects2 output unchanged: 2fad01a4b9b4f67d94b24cb9700d8bc9a945c8b07b69790268cfe41777b6b7e6
-- Fresh 12-unit append output unchanged: ec61f85ed6894cbc0c31e47fc72ce382f856499372aba5550d88ac30946a7c2b
-- Multi-artifact output unchanged: be9c73c458762e8243c54acb0154768617f5d34997370865cd538ad3a51724cd
+- Multi-artifact regression output unchanged: be9c73c458762e8243c54acb0154768617f5d34997370865cd538ad3a51724cd
+- Shoreline building-over-trees control: compiled-grid 0 diff vs native Другой берег7.sav; all building attached states 0 diff
+
+Original supplied game files load successfully: 102 units, 167 artifacts, 35 spell sections, CostRecruitDiv=2, 285 Objects.ugs decoration records.

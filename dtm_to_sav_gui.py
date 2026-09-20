@@ -693,6 +693,8 @@ class QuestSyncApp(tk.Tk):
                 f"Клеток ландшафта: {len(plan.terrain_changes)}. "
                 f"Изменено армий: {len(plan.army_changes)}. "
                 f"Новых строений: {len(plan.building_additions)}. "
+                f"Неизвестных native-footprint профилей: {len(plan.building_navigation_unseen_profile_ids)}. "
+                f"Новых строений без runtime-core шаблона: {len(plan.building_runtime_template_missing_ids)}. "
                 f"Новых Фонарь/Events: {len(plan.lantern_additions)}. "
                 f"Изменено Фонарь/Events: {len(plan.lantern_changed_ids)}. "
                 f"Удалено Фонарь/Events: {len(plan.lantern_removed_ids)}. "
@@ -719,6 +721,20 @@ class QuestSyncApp(tk.Tk):
             if plan.building_additions:
                 ids = ", ".join(str(item.index + 1) for item in plan.building_additions)
                 self._log(f"Будут добавлены строения: {ids}.")
+            if plan.building_navigation_unseen_profile_ids:
+                ids = ", ".join(map(str, plan.building_navigation_unseen_profile_ids))
+                self._log(
+                    "ВНИМАНИЕ: для строений ID " + ids
+                    + " exact navigation-footprint не наблюдался в исходном SAV; "
+                      "будет использован прямоугольный fallback size_x×size_y."
+                )
+            if plan.building_runtime_template_missing_ids:
+                ids = ", ".join(map(str, plan.building_runtime_template_missing_ids))
+                self._log(
+                    "ВНИМАНИЕ: для новых строений ID " + ids
+                    + " нет runtime-core шаблона того же типа в исходном SAV; "
+                      "opaque bytes не считаются byte-certified."
+                )
             if plan.lantern_additions:
                 ids = ", ".join(str(item.lantern_id) for item in plan.lantern_additions)
                 self._log(f"Будут добавлены Фонарь/Events: {ids}.")
@@ -756,6 +772,8 @@ class QuestSyncApp(tk.Tk):
                     f"Будет изменено клеток ландшафта: {len(plan.terrain_changes)}.\n"
                     f"Будет синхронизировано армий: {len(plan.army_changes)}.\n"
                     f"Будет добавлено строений: {len(plan.building_additions)}.\n"
+                    f"Footprint fallback: {len(plan.building_navigation_unseen_profile_ids)} строений.\n"
+                    f"Без runtime-core шаблона: {len(plan.building_runtime_template_missing_ids)} строений.\n"
                     f"Будет добавлено Фонарь/Events: {len(plan.lantern_additions)}.\n"
                     f"Будет изменено Фонарь/Events: {len(plan.lantern_changed_ids)}.\n"
                     f"Будет удалено Фонарь/Events: {len(plan.lantern_removed_ids)}.\n"

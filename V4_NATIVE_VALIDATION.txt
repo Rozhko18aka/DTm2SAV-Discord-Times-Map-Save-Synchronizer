@@ -1,0 +1,30 @@
+Discord Times QuestSync - native validation v4
+Date: 2026-09-20
+
+Automated validation
+- Python compile: PASS
+- GUI import: PASS
+- Automated unit/regression/property tests: 78/78 PASS
+- Structural/property corpus: 50 formal cases
+- Seeded fuzz: 2000 exact-survivor + 500 structural iterations
+
+Newest 102-army singleton control: New.DTm / New.sav
+- 102/102 native army blocks pass the strict verifier.
+- All 102 Unit IDs now have an exact native level-0 base profile.
+- QuestSync no-op (New.sav + New.DTm -> New.DTm) is byte-identical at packed SAV level.
+- Source/output SHA-256: 64260ac4aeaef978031b055dfed315e1c97f0134226149f42cfae6c4f9a2e1b8
+- +0x1E9D is proven context-dependent; it is not a universal Unit-ID field.
+- Production uses 185 conflict-free semantic ArmyData-context profiles for +0x1E9D, with zero contextual conflicts.
+- The diagnostic per-main-Unit view has 85 stable IDs and 17 context-dependent/conflicted IDs; it is never used as a synthesis fallback.
+
+Native regression reruns
+- New1 + New.DTm -> New2.DTm: compiled grid 0 diff; 15/15 NPC runtime bodies +0x800..end byte-exact.
+- Другой берег + Другой берег.DTm -> Другой берег2.DTm: 62/62 NPC runtime bodies +0x800..end byte-exact; native target has the previously documented unrelated one-byte compiled-grid runtime difference.
+- Другой берег4 -> Другой берег3: artifact-edited armies #63/#64/#65 body byte-exact; #62 differs only at the previously documented independent opaque unit-model byte +0x81C. All edit-caused bytes are exact.
+
+Native profile overlay
+- 102/102 Unit IDs covered.
+- 210 exact Unit+Level base profiles.
+- 136 exact modified profiles.
+- 139 exact modified-strength entries.
+- 185 exact semantic +0x1E9D ArmyData contexts, 0 contextual conflicts.

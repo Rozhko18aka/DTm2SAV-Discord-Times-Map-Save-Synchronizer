@@ -1,0 +1,25 @@
+DTm2SAV v6.2 native validation
+==============================
+Control: Другой берег / Другой берег7
+
+DTm semantic delta
+- decorations: 13531 -> 13479 (52 removed)
+- buildings: 186 -> 188 (2 appended)
+- terrain: unchanged
+- armies: unchanged
+- lanterns/events: unchanged
+
+Recovered native rules
+- Every building navigation cell uses hidden property values C/A/B = 3/6/3.
+- Verified across 1816 existing source-building navigation cells.
+- Building picture (1,0), size 8x7, has an 8x8 native navigation footprint: one connected top row exists outside BuildingData size_y.
+- Matching source picture footprints are learned from the SAV rather than hard-coded.
+- Building placement itself does not modify the visual-color grid; removed decorations do.
+
+Result
+- compiled-grid: 0 diff against native Другой берег7.sav
+- source->native changed grid bytes: 534
+- source->generated changed grid bytes: 534
+- changed offsets/values: exact match
+- attached building runtime states: 188/188 exact
+- automated suite: 108/108 PASS

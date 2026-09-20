@@ -1,0 +1,32 @@
+Discord Times QuestSync - native validation v5
+Date: 2026-09-20
+
+Objects / Objects2 building corpus
+- 16 BuildingData records in both maps; pure empty/configured-state control.
+- Native V.4 BuildingData offsets used by QuestSync:
+  recruits +264, owner +292, barracks +294, market count +295,
+  spells +308, garrison +314, extra defence +332,
+  price range +333/+335, group +337, relations +338,
+  mana +350, hero-start flags +353..+356.
+- Building types 1/3/4/12 own a 14375-byte attached garrison state.
+- Generated Objects -> Objects2 attached state matches native target 5/5 blocks with 0 differing bytes.
+- Garrison synthesis covers native Unit records, building extra defence, formation,
+  tactical strength, payment, HP sum, total cost and ruins residual item state.
+- Fixed market items use native negative int16 runtime IDs; random stock uses positive IDs.
+- Existing market stock is preserved. A fresh randomized market uses deterministic valid
+  selection because independent native loads do not have a reproducible RNG stream.
+- Village current gold/mana initializes from configured income; castle/fort do not.
+- Altar editor artifacts are not copied as runtime market stock.
+
+Structural building support
+- add/edit/delete/insert/reorder supported
+- complete footprint clear/rebuild
+- native overlapping-footprint precedence supported (later BuildingData wins field +5)
+- EventData building references and hero/NPC runtime start-building IDs remapped
+- strict runtime/reference/grid verifier enabled
+
+Validation
+- 95/95 automated tests PASS
+- Objects no-op packed SAV byte-identical
+- Objects2 no-op packed SAV byte-identical
+- synthetic delete-middle + renumber + append filled castle PASS

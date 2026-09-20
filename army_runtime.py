@@ -731,12 +731,26 @@ def calculate_upkeep(unit:dict, cost_recruit_div:int|float|None=2)->int:
 
 
 def _catalog_cost_recruit_div(catalog:dict):
-    """Read optional _Global.ini-derived divisor from catalog; default is 2."""
+    """Read and normalize optional _Global.ini-derived divisor.
+
+    Live ``_Global.ini`` values are parsed as strings by ``game_resources``.
+    Keep the normalization here so every runtime caller receives a numeric
+    divisor, including building garrison synthesis.  Invalid/non-positive
+    values fall back to the native default 2.
+    """
+    raw = 2
     for key in ('_global','global','Global'):
         d=catalog.get(key)
         if isinstance(d,dict) and 'CostRecruitDiv' in d:
-            return d.get('CostRecruitDiv')
-    return 2
+            raw = d.get('CostRecruitDiv')
+            break
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = 2.0
+    if not math.isfinite(value) or value <= 0.0:
+        value = 2.0
+    return value
 
 
 def _bonus_for(unit:dict, items:list[dict]):

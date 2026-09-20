@@ -187,8 +187,9 @@ class BuildingAddition:
     coordinate_template_index: int | None
     runtime_state_added: bool
     pointer_template_index: int | None
-    core: bytes
-    state: bytes
+    core: bytes = b""
+    state: bytes = b""
+    serialized_size: int | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -208,7 +209,11 @@ class BuildingAddition:
                 self.pointer_template_index + 1
                 if self.pointer_template_index is not None else None
             ),
-            "serialized_size": len(self.core) + len(self.state),
+            "serialized_size": (
+                self.serialized_size
+                if self.serialized_size is not None
+                else len(self.core) + len(self.state)
+            ),
         }
 
 
@@ -344,6 +349,8 @@ class SyncPlan:
     objects_ugs: Path | None
     hero_replacement: bytes | None
     building_additions: list[BuildingAddition]
+    building_navigation_unseen_profile_ids: list[int]
+    building_runtime_template_missing_ids: list[int]
     lantern_additions: list[LanternAddition]
     lantern_records: list[LanternAddition]
     lantern_rewrite: bool
@@ -1048,6 +1055,159 @@ def prepare_decoration_changes(
     return additions, removals, affected, rebuild_old, rebuild_new
 
 
+def _building_navigation_profile_key(
+    record: building_runtime.BuildingRecord,
+) -> tuple[int, int, int, int, int]:
+    return (
+        record.picture_variant,
+        record.picture_number,
+        record.building_type,
+        record.size_x,
+        record.size_y,
+    )
+
+
+def _building_grid_semantics_changed(old_raw: bytes, new_raw: bytes) -> bool:
+    """Return whether a BuildingData edit can change compiled-grid occupancy.
+
+    Navigation footprint is keyed by picture variant/number, building type and
+    nominal size in addition to the DTm anchor coordinates.  Comparing only
+    x/y and size_x/size_y leaves stale field+5/property cells when an editor
+    swaps the building picture or type without moving/resizing it.
+    """
+    if len(old_raw) != BUILDING_SIZE or len(new_raw) != BUILDING_SIZE:
+        raise ValueError("BuildingData record must be 358 bytes")
+    if old_raw[:4] != new_raw[:4]:
+        return True
+    for off in (
+        building_runtime.PICTURE_NUMBER_OFF,
+        building_runtime.PICTURE_VARIANT_OFF,
+        building_runtime.TYPE_OFF,
+        building_runtime.SIZE_X_OFF,
+        building_runtime.SIZE_Y_OFF,
+    ):
+        if old_raw[off] != new_raw[off]:
+            return True
+    return False
+
+
+def _building_addition_report(
+    target_index: int,
+    raw: bytes,
+) -> BuildingAddition:
+    """Create the legacy GUI/report row from the active runtime path."""
+    record = building_runtime.parse_building_record(raw)
+    save_x, save_y = record.runtime_coords
+    state_size = (
+        building_runtime.RUNTIME_GARRISON_SIZE if record.runtime_garrison else 0
+    )
+    return BuildingAddition(
+        index=target_index,
+        building_type=record.building_type,
+        picture_number=record.picture_number,
+        picture_variant=record.picture_variant,
+        raw_x=record.x,
+        raw_y=record.y,
+        save_x=save_x,
+        save_y=save_y,
+        coordinate_template_index=None,
+        runtime_state_added=record.runtime_garrison,
+        pointer_template_index=None,
+        core=b"",
+        state=b"",
+        serialized_size=building_runtime.BUILDING_SIZE + state_size,
+    )
+
+
+def _building_additions_from_mapping(
+    mapping: list[int | None],
+    new_raw_records: list[bytes],
+) -> list[BuildingAddition]:
+    """Return report/GUI rows for structurally new target buildings."""
+    return [
+        _building_addition_report(target, new_raw_records[target])
+        for target, source in enumerate(mapping)
+        if source is None
+    ]
+
+
+def infer_building_navigation_profiles(
+    payload: bytes,
+    relationship: dict[str, Any],
+    records: list[building_runtime.BuildingRecord],
+    cell_table_base_u16: int,
+    cell_table_stride: int,
+    width: int,
+    height: int,
+) -> dict[tuple[int, int, int, int, int], set[tuple[int, int]]]:
+    """Learn navigation cells that extend beyond BuildingData size_x/size_y.
+
+    Native V.4 saves show that some building pictures have an extra navigation
+    row not represented by ``size_y`` (Town pictures 1:0 and 1:1 on the
+    supplied shoreline control).  Rather than hard-code a picture list, learn
+    connected extra cells from the source SAV and reuse them for buildings with
+    the same picture/type/size signature.  The ordinary rectangular footprint
+    remains the fallback for unseen pictures.
+    """
+    grid = relationship["compiled_grid"]
+    grid_offset = grid["offset"]
+    grid_end = grid_offset + grid["cell_layers_size"]
+
+    def nav_value(x: int, y: int) -> int:
+        index = cell_table_base_u16 + 9 * (x + cell_table_stride * y) + 5
+        off = grid_offset + index * 2
+        if not grid_offset <= off <= grid_end - 2:
+            return -1
+        return struct.unpack_from("<H", payload, off)[0]
+
+    profiles: dict[tuple[int, int, int, int, int], set[tuple[int, int]]] = {}
+    for record in records:
+        standard = set(record.footprint)
+        anchor = record.x + cell_table_stride * record.y
+        # Flood only outward from the normal rectangle.  Field +5 also stores
+        # unrelated navigation metadata elsewhere on the map, so a global
+        # search for the same numeric value would create false positives.
+        frontier: list[tuple[int, int]] = []
+        queued = set(standard)
+        for x, y in standard:
+            for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                cell = (x + dx, y + dy)
+                if cell in queued:
+                    continue
+                if 0 <= cell[0] < width and 0 <= cell[1] < height:
+                    queued.add(cell)
+                    frontier.append(cell)
+        extras: set[tuple[int, int]] = set()
+        while frontier:
+            x, y = frontier.pop()
+            if nav_value(x, y) != anchor:
+                continue
+            extras.add((x - record.x, y - record.y))
+            for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                cell = (x + dx, y + dy)
+                if cell in queued:
+                    continue
+                if 0 <= cell[0] < width and 0 <= cell[1] < height:
+                    queued.add(cell)
+                    frontier.append(cell)
+        key = _building_navigation_profile_key(record)
+        # Presence of an empty set is meaningful: this exact signature was
+        # observed in the source SAV and its native footprint was rectangular.
+        # Missing keys are the only cases using the unseen-picture fallback.
+        profiles.setdefault(key, set()).update(extras)
+    return profiles
+
+
+def building_navigation_footprint(
+    record: building_runtime.BuildingRecord,
+    profiles: dict[tuple[int, int, int, int, int], set[tuple[int, int]]],
+) -> set[tuple[int, int]]:
+    cells = set(record.footprint)
+    for dx, dy in profiles.get(_building_navigation_profile_key(record), ()):
+        cells.add((record.x + dx, record.y + dy))
+    return cells
+
+
 def validate_decoration_rebuild_safety(
     payload: bytes,
     relationship: dict[str, Any],
@@ -1514,8 +1674,19 @@ def analyze_paths(
         old_building_records != new_building_records
         or building_structure_changed
     )
-    # Legacy append-only report field retained for backward-compatible JSON.
-    building_additions: list[BuildingAddition] = []
+    building_grid_semantics_changed = building_structure_changed or any(
+        source is None
+        or _building_grid_semantics_changed(
+            old_building_records[source], new_building_records[target]
+        )
+        for target, source in enumerate(building_mapping)
+    )
+    # Keep the legacy GUI/report field populated from the active structural
+    # mapping.  Runtime construction itself is handled later by
+    # building_runtime.build_runtime_blob().
+    building_additions = _building_additions_from_mapping(
+        building_mapping, new_building_records
+    )
     (
         lantern_additions,
         lantern_records,
@@ -1533,6 +1704,33 @@ def analyze_paths(
     cell_table_base_u16, cell_table_stride = infer_cell_table(
         payload, original, original_sections, relationship
     )
+    parsed_old_buildings = [
+        building_runtime.parse_building_record(raw) for raw in old_building_records
+    ]
+    parsed_new_buildings = [
+        building_runtime.parse_building_record(raw) for raw in new_building_records
+    ]
+    observed_navigation_profiles = infer_building_navigation_profiles(
+        payload,
+        relationship,
+        parsed_old_buildings,
+        cell_table_base_u16,
+        cell_table_stride,
+        width,
+        height,
+    )
+    building_navigation_unseen_profile_ids = [
+        index + 1
+        for index, record in enumerate(parsed_new_buildings)
+        if _building_navigation_profile_key(record) not in observed_navigation_profiles
+    ]
+    source_building_types = {record.building_type for record in parsed_old_buildings}
+    building_runtime_template_missing_ids = [
+        target + 1
+        for target, source in enumerate(building_mapping)
+        if source is None
+        and parsed_new_buildings[target].building_type not in source_building_types
+    ]
     cell_layer_u16_count = relationship["compiled_grid"]["cell_layers_size"] // 2
     (
         property_ring_size_u16,
@@ -1579,7 +1777,7 @@ def analyze_paths(
         modified_sections["decorations"]["end"]
     ]
     decorations_changed = original_decoration_bytes != modified_decoration_bytes
-    if decorations_changed or terrain_changes:
+    if decorations_changed or terrain_changes or building_grid_semantics_changed:
         resolved_objects_ugs = locate_objects_ugs(
             objects_ugs,
             source_sav,
@@ -1708,6 +1906,8 @@ def analyze_paths(
         objects_ugs=resolved_objects_ugs,
         hero_replacement=hero_replacement,
         building_additions=building_additions,
+        building_navigation_unseen_profile_ids=building_navigation_unseen_profile_ids,
+        building_runtime_template_missing_ids=building_runtime_template_missing_ids,
         lantern_additions=lantern_additions,
         lantern_records=lantern_records,
         lantern_rewrite=lantern_rewrite,
@@ -1756,8 +1956,14 @@ def plan_summary(plan: SyncPlan, include_events: bool = True) -> dict[str, Any]:
         ],
         "deleted_source_building_ids": [index + 1 for index in plan.building_deleted_indices],
         # Backward-compatible aliases retained for older GUI/report readers.
-        "appended_building_count": sum(source is None for source in plan.building_mapping),
-        "appended_buildings": [],
+        "appended_building_count": len(plan.building_additions),
+        "appended_buildings": [item.as_dict() for item in plan.building_additions],
+        "building_navigation_unseen_profile_ids": list(
+            plan.building_navigation_unseen_profile_ids
+        ),
+        "building_runtime_template_missing_ids": list(
+            plan.building_runtime_template_missing_ids
+        ),
         "source_army_count": plan.army_count,
         "modified_army_count": plan.modified_army_count,
         "changed_army_count": len(plan.army_changes),
@@ -1844,9 +2050,9 @@ def build_synced_payload(plan: SyncPlan) -> tuple[bytes, dict[str, Any]]:
     deleted_building_ids = {index + 1 for index in building_deleted_indices}
     building_grid_changed = plan.building_structure_changed or any(
         source is None
-        or old_building_records[source].raw[:4] != new_building_records[target].raw[:4]
-        or old_building_records[source].raw[building_runtime.SIZE_X_OFF:building_runtime.SIZE_Y_OFF + 1]
-           != new_building_records[target].raw[building_runtime.SIZE_X_OFF:building_runtime.SIZE_Y_OFF + 1]
+        or _building_grid_semantics_changed(
+            old_building_records[source].raw, new_building_records[target].raw
+        )
         for target, source in enumerate(building_mapping)
     )
 
@@ -2050,6 +2256,29 @@ def build_synced_payload(plan: SyncPlan) -> tuple[bytes, dict[str, Any]]:
         if not grid_offset <= byte_offset <= grid_end - 2:
             raise QuestSyncError("Координаты объекта выходят за клеточную таблицу SAV.")
         return byte_offset
+
+    building_navigation_profiles = infer_building_navigation_profiles(
+        bytes(payload),
+        plan.relationship,
+        old_building_records,
+        plan.cell_table_base_u16,
+        plan.cell_table_stride,
+        plan.width,
+        plan.height,
+    )
+    old_building_footprints = [
+        building_navigation_footprint(record, building_navigation_profiles)
+        for record in old_building_records
+    ]
+    new_building_footprints = [
+        building_navigation_footprint(record, building_navigation_profiles)
+        for record in new_building_records
+    ]
+    building_navigation_unseen_profile_ids = [
+        index + 1
+        for index, record in enumerate(new_building_records)
+        if _building_navigation_profile_key(record) not in building_navigation_profiles
+    ]
 
     # Army occupancy markers live in cell fields 3/4.  Structural army-ID
     # changes must be applied even when an army has moved during gameplay.
@@ -2297,11 +2526,92 @@ def build_synced_payload(plan: SyncPlan) -> tuple[bytes, dict[str, Any]]:
         for item in plan.decoration_additions:
             apply_decoration(item, False)
 
+    building_property_writes = 0
+    if building_grid_changed:
+        # Building navigation has its own hidden collision/property layer.
+        # Native V.4 saves use C/A/B = 3/6/3 on every navigation-footprint
+        # cell.  When a building is deleted or moved, reconstruct the affected
+        # property cells from the modified terrain + modified decorations
+        # first, then apply target buildings on top.  Building placement does
+        # not itself alter the visual-color grid.
+        affected_building_cells: set[tuple[int, int]] = set()
+        for footprint in old_building_footprints:
+            affected_building_cells.update(footprint)
+        for footprint in new_building_footprints:
+            affected_building_cells.update(footprint)
+
+        def set_building_property(index: int, value: int) -> None:
+            nonlocal building_property_writes
+            if index < 0:
+                return
+            before = grid_u16(index)
+            if before != value:
+                set_grid_u16(index, value)
+                building_property_writes += 1
+
+        for x, y in sorted(affected_building_cells):
+            if not (0 <= x < plan.width and 0 <= y < plan.height):
+                raise QuestSyncError(
+                    f"Область строения выходит за карту: ({x}, {y})."
+                )
+            tile_id = surface[x + plan.width * y]
+            a_index = terrain_property_index(0, x, y)
+            b_index = terrain_property_index(1, x, y)
+            c_index = a_index - plan.property_ring_size_u16
+            set_building_property(c_index, PROPERTY_C_TERRAIN_BASE[tile_id])
+            set_building_property(a_index, PROPERTY_A_TERRAIN_BASE[tile_id])
+            set_building_property(b_index, PROPERTY_B_TERRAIN_BASE[tile_id])
+
+        if plan.objects_ugs is None:
+            raise QuestSyncError(
+                "Для изменения области строения нужен Graphics\\Objects\\Objects.ugs."
+            )
+        building_atlas = parse_objects_ugs(plan.objects_ugs)
+        modified_decorations_for_buildings = _parse_decorations(
+            plan.modified_inner,
+            plan.modified_sections["decorations"],
+            building_atlas,
+            plan.width,
+            plan.height,
+        )
+        for item in modified_decorations_for_buildings:
+            overlap = _decoration_cells(item) & affected_building_cells
+            if not overlap:
+                continue
+            for x, y in overlap:
+                tile_id = surface[x + plan.width * y]
+                a_index = terrain_property_index(0, x, y)
+                b_index = terrain_property_index(1, x, y)
+                c_index = a_index - plan.property_ring_size_u16
+                for index, property_kind in (
+                    (c_index, 2),
+                    (a_index, 0),
+                    (b_index, 1),
+                ):
+                    if index < 0:
+                        continue
+                    before = grid_u16(index)
+                    after = update_property(before, item.atlas, tile_id, property_kind)
+                    if after != before:
+                        set_grid_u16(index, after)
+                        building_property_writes += 1
+
+        for footprint in new_building_footprints:
+            for x, y in footprint:
+                a_index = terrain_property_index(0, x, y)
+                b_index = terrain_property_index(1, x, y)
+                c_index = a_index - plan.property_ring_size_u16
+                set_building_property(c_index, 3)
+                set_building_property(a_index, 6)
+                set_building_property(b_index, 3)
+
     if building_grid_changed:
         # Remove the complete old footprint.  Field +1 stores Building ID only
         # at the DTm anchor; field +5 stores the anchor linear index on every
         # footprint cell (native Objects control, all building sizes).
-        for source_index, record in enumerate(old_building_records):
+        for source_index, (record, footprint) in enumerate(
+            zip(old_building_records, old_building_footprints)
+        ):
             if not (0 <= record.x < plan.width and 0 <= record.y < plan.height):
                 raise QuestSyncError(
                     f"Исходное строение №{source_index + 1} находится вне карты."
@@ -2310,7 +2620,7 @@ def build_synced_payload(plan: SyncPlan) -> tuple[bytes, dict[str, Any]]:
             if struct.unpack_from("<H", payload, id_off)[0] == source_index + 1:
                 struct.pack_into("<H", payload, id_off, 0)
             old_anchor = record.x + plan.cell_table_stride * record.y
-            for x, y in record.footprint:
+            for x, y in footprint:
                 if not (0 <= x < plan.width and 0 <= y < plan.height):
                     raise QuestSyncError(
                         f"Область исходного строения №{source_index + 1} выходит за карту."
@@ -2326,7 +2636,9 @@ def build_synced_payload(plan: SyncPlan) -> tuple[bytes, dict[str, Any]]:
         # record wins on a shared footprint cell. Anchor IDs in field +1 remain
         # independent, so only duplicate anchor coordinates are invalid.
         anchor_cells: set[tuple[int, int]] = set()
-        for target_index, record in enumerate(new_building_records):
+        for target_index, (record, footprint) in enumerate(
+            zip(new_building_records, new_building_footprints)
+        ):
             if not (0 <= record.x < plan.width and 0 <= record.y < plan.height):
                 raise QuestSyncError(
                     f"Строение №{target_index + 1} находится вне карты: ({record.x}, {record.y})."
@@ -2337,7 +2649,7 @@ def build_synced_payload(plan: SyncPlan) -> tuple[bytes, dict[str, Any]]:
                     f"Два строения имеют одну якорную клетку {anchor_cell}."
                 )
             anchor_cells.add(anchor_cell)
-            for x, y in record.footprint:
+            for x, y in footprint:
                 if not (0 <= x < plan.width and 0 <= y < plan.height):
                     raise QuestSyncError(
                         f"Область строения №{target_index + 1} выходит за карту."
@@ -2350,7 +2662,7 @@ def build_synced_payload(plan: SyncPlan) -> tuple[bytes, dict[str, Any]]:
                 )
             struct.pack_into("<H", payload, id_off, target_index + 1)
             anchor = record.x + plan.cell_table_stride * record.y
-            for x, y in record.footprint:
+            for x, y in footprint:
                 nav_off = cell_field_offset(x, y, 5)
                 # Do not reject a different building anchor here: native maps
                 # intentionally allow footprint overlap. Processing in target
@@ -2599,7 +2911,7 @@ def build_synced_payload(plan: SyncPlan) -> tuple[bytes, dict[str, Any]]:
         if struct.unpack_from("<H", new_payload, id_off)[0] != building_index:
             raise QuestSyncError(f"Строение №{building_index}: неверный Building ID в compiled grid.")
     expected_navigation = building_runtime.expected_navigation_owners(
-        new_building_records, plan.cell_table_stride
+        new_building_records, plan.cell_table_stride, new_building_footprints
     )
     for (x, y), (anchor, building_index) in expected_navigation.items():
         nav_off = cell_field_offset(x, y, 5)
@@ -2624,6 +2936,17 @@ def build_synced_payload(plan: SyncPlan) -> tuple[bytes, dict[str, Any]]:
             "army_runtime_size_delta": len(synced_tail) - len(source_tail),
             "army_runtime_sync_enabled": bool(has_army_binary_change or has_army_structure_change),
             "terrain_grid_write_count": terrain_grid_writes,
+            "building_property_write_count": building_property_writes,
+            "building_navigation_profile_count": len(building_navigation_profiles),
+            "building_navigation_extra_cell_count": sum(
+                len(cells) for cells in building_navigation_profiles.values()
+            ),
+            "building_navigation_unseen_profile_building_ids": (
+                building_navigation_unseen_profile_ids
+            ),
+            "building_navigation_uses_rectangular_fallback": bool(
+                building_navigation_unseen_profile_ids
+            ),
             "decoration_property_write_count": decoration_property_writes,
             "decoration_visual_write_count": decoration_visual_writes,
             "decoration_visual_values_are_experimental": bool(

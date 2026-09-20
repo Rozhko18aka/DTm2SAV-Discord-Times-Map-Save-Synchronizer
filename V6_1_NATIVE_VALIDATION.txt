@@ -1,0 +1,50 @@
+Discord Times QuestSync - live game-data validation v6.1
+Date: 2026-09-20
+
+Behavioral change
+-----------------
+The GUI now refuses to start unless all required game-data sources exist beside
+the application:
+  Rus_Units.ini
+  Rus_Artefacts.ini
+  Rus_Spells.ini
+  _Global.ini
+  Graphics\Objects\Objects.ugs
+
+These files are parsed at startup. The live catalog drives unit stats, level-up
+values, Cost/CostMultipler/CostGoldDiv, artifacts, spell modifiers and
+CostRecruitDiv. The embedded army_catalog.json is only the tested reference.
+
+Profile compatibility
+---------------------
+Live gameplay fields are compared to the embedded reference while cosmetic
+name/description/icon fields are ignored. Changed Unit/Artifact/Spell IDs and a
+changed CostRecruitDiv are reported to the user. Saving remains enabled.
+
+For an affected changed combination, byte-certified exact native profiles are
+not reused. Reconstructed formulas are used instead, including in production
+strict mode. Unchanged combinations retain the old strict native-profile rules.
+
+Regression proof
+----------------
+All six available v5 end-to-end controls produce byte-identical v6.1 outputs:
+- New 102-army no-op
+- Objects no-op
+- Objects2 no-op
+- Objects -> Objects2
+- fresh 12-unit army append
+- multi-artifact existing-army edit
+
+Automated result: 106/106 PASS.
+
+Original retail game-data validation
+------------------------------------
+The loader was validated against the supplied original game files:
+- 102 units from Rus_Units.ini
+- 167 artifacts from Rus_Artefacts.ini
+- 35 spell sections from Rus_Spells.ini
+- CostRecruitDiv=2 from _Global.ini
+- 285 parsed decoration atlas records from Graphics\Objects\Objects.ugs
+
+All gameplay parameters match the embedded tested reference (0 changed Unit/Artifact/Spell IDs; Global profile unchanged).
+The original Rus_Spells.ini contains a visual separator line made only of dashes inside a section; v6.1 explicitly accepts this legacy syntax.

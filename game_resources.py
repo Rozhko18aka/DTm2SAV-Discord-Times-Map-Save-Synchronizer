@@ -105,6 +105,12 @@ def parse_legacy_ini(path: Path) -> list[tuple[str, dict[str, str]]]:
             # Legacy files may contain harmless preamble text before section 1.
             continue
         if "=" not in raw:
+            # Original Discord Times INI files may contain visual separators
+            # inside a section (for example a line made only of dashes in
+            # Rus_Spells.ini).  They carry no data and must not make the
+            # resource loader reject an otherwise valid game installation.
+            if line and all(ch in "-_=*~" for ch in line):
+                continue
             raise GameDataError(f"{path.name}:{line_no}: ожидалось Имя=Значение")
         key, value = raw.split("=", 1)
         key = key.strip()
