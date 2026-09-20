@@ -1,0 +1,38 @@
+Final validation v6 (2026-09-20)
+================================
+
+Automated validation
+- 105/105 tests PASS
+- Python compile PASS
+- GUI/module import PASS
+- CP1251 legacy INI parsing PASS
+- duplicate Rus_Spells.ini section-order preservation PASS
+- real Objects.ugs parser startup validation PASS (synthetic 200-record UGS)
+- modified live unit/artifact/global values are used by runtime calculations, not only reported
+- modified-profile combinations are allowed through formula fallback while standard unchanged unknown profiles remain strict
+
+Mandatory startup game data
+- Rus_Units.ini beside application
+- Rus_Artefacts.ini beside application
+- Rus_Spells.ini beside application
+- _Global.ini beside application
+- Graphics\Objects\Objects.ugs relative to application
+- missing/unreadable source: fatal startup error instructing the user to run from the Discord Times game folder
+- profile differences: non-blocking warning, saving remains enabled
+- sync JSON records source paths and SHA-256 hashes
+
+Regression parity with v5 standard profile
+- New 102-army no-op: byte-identical, SHA-256
+  64260ac4aeaef978031b055dfed315e1c97f0134226149f42cfae6c4f9a2e1b8
+- Objects no-op: byte-identical, SHA-256
+  de30db63c56e561d4407066ac0e225ed77516fdbc735eab32eac5d8f92adebd7
+- Objects2 no-op: byte-identical, SHA-256
+  ff918ec879f849cf08b4b87cf797fd070601cbc2b896f5ce5c95d7ce3d54cf55
+- Objects -> Objects2 output equals v5 output byte-for-byte, SHA-256
+  2fad01a4b9b4f67d94b24cb9700d8bc9a945c8b07b69790268cfe41777b6b7e6
+- fresh 12-unit append output equals v5 output byte-for-byte, SHA-256
+  ec61f85ed6894cbc0c31e47fc72ce382f856499372aba5550d88ac30946a7c2b
+- multi-artifact output equals v5 output byte-for-byte, SHA-256
+  be9c73c458762e8243c54acb0154768617f5d34997370865cd538ad3a51724cd
+
+Building/army verifiers and the v5 native guarantees remain enabled.

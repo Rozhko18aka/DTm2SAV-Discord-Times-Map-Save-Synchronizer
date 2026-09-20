@@ -1,0 +1,192 @@
+QuestSync army-runtime regression status
+=======================================
+
+Legacy native controls
+----------------------
+Validated against the previously supplied Discord Times control pairs:
+
+1. Устье Трейна2: one army appended at the end (army #44).
+2. Устье Трейна3: one Bombardier appended to army #1.
+3. Устье Трейна4: last army #43 removed.
+4. Устье Трейна5: one Robber (Грабитель) removed from army #1.
+5. Устье Трейна6: army #22 removed from the middle of the list.
+
+For all five controls the generated save matched the native control save in the
+known structural layers, Army-ID references and every NPC runtime-army body from
++0x0800 through the end of the 0x3827 block. The no-op source-map conversion was
+also byte-identical at packed SAV and unpacked payload level.
+
+New native corpus (2026-09-20)
+==============================
+
+Inputs used during validation (not distributed in the project ZIP):
+- New.DTm: map containing all unit types.
+- New1.sav: native save immediately after loading New.DTm.
+- New1_2.sav: native save after one game hour.
+- New1_3.sav: native save after additional game time.
+- New2.DTm / New2.sav: native structural control with a middle army removed and
+  a new army created afterwards.
+- Editor1.3.10.1.exe: .NET editor used only to recover the exact calculator IL.
+- Другой берег.DTm / .sav and Другой берег2.DTm / .sav: fresh maximum-size
+  12-unit army append control.
+
+Native Unit coverage:
+- 102/102 Unit IDs observed.
+- 210 conflict-free exact Unit-ID + level base profiles; every Unit ID has an exact level-0 profile.
+- 136 conflict-free exact modified spell/artifact profiles.
+- 105 runtime-unit observations from New1.sav rebuild in strict mode with zero
+  mismatches in base stat block, modified stat block, base strength, modified
+  strength and class.
+
+
+Native 102-singleton control
+----------------------------
+- New.DTm/New.sav contains 102 NPC armies, one ordinary Unit ID per army.
+- All 102 runtime blocks pass the strict verifier.
+- It contributes exact level-0 v1/v2/base-strength/class data for all 102 IDs.
+- Same-map/no-op conversion is byte-identical at packed SAV level.
+- The control is also what disproved the old +0x1E9D `Unit ID -> code` model:
+  merging it with the multi-unit corpus produces 17 per-Unit conflicts but zero
+  conflicts across 185 full semantic ArmyData contexts.
+
+Structural New -> New2 result:
+- Native behavior is delete old army #4, shift old #5..#15 to #4..#14, append
+  the new army as #15.
+- Generated compiled grid: 0 differing bytes versus native New2.sav.
+- All 15 generated NPC runtime bodies +0x0800..end: 0 differing bytes versus
+  native New2.sav.
+- Opaque slot headers +0x000..+0x07FF remain destination-slot state by design;
+  they are preserved rather than synthesized from DTm.
+
+Native 12-unit fresh-army control:
+- Другой берег.DTm/SAV is the base; Другой берег2.DTm/SAV appends army #62
+  with the maximum 12 units.
+- Formation is reconstructed from descending modified strength plus dominant
+  modified attack (front/back preference), spilling overflow into the opposite
+  line. The native 18-entry formation matches exactly.
+- All 62 generated NPC runtime bodies +0x0800..end: 0 differing bytes versus
+  native Другой берег2.sav, including all 12 unit records, aggregate strength
+  4398, payment 480, HP sum 870, formation and direct runtime fields.
+- The two DTm files are byte-identical in surface/decorations/buildings/lanterns/events;
+  only the 89-byte army append differs. QuestSync reproduces all four structural
+  compiled-grid changes caused by that append. Native Другой берег2.sav has one
+  additional layer-12 runtime byte (0->17) unrelated to the DTm edit; it is
+  intentionally preserved from the source SAV rather than fabricated.
+- Patrol companion field +0x1F10 is proven across 62/62 native armies: 8 only
+  for patrol_exists=1 with radius=0; otherwise 5.
+- +0x1E9D is not a pure leader/Unit-ID field. The new 102-singleton control
+  exposed 17 Unit IDs whose value changes in other army contexts. Production
+  now keys this dword by the semantic ArmyData context (coordinates and Army ID
+  excluded): 185 observed contexts are conflict-free. The old per-Unit view is
+  kept only as diagnostic evidence (85 exact IDs, 17 conflicts) and is never
+  used as a synthesis fallback.
+
+Native multi-artifact existing-army control
+------------------------------------------
+- Другой берег4.DTm/SAV is the base; Другой берег3.DTm/SAV changes only armies
+  #62..#65 and equips exactly three artifacts on each (12 artifacts total).
+- Native allocation rule is recovered exactly: process DTm items_ids left-to-right;
+  for each item, test all currently compatible units/slots and equip it on the
+  unit with the largest immediate increase in current tactical cost. Ties keep
+  runtime/DTm unit order. The rule reproduces all 12/12 native recipients.
+- Native equipment constraints are enforced: Mecha rejects equipment, magic
+  affinity must match, Item is not equipable, one weapon total per unit, and
+  Armor/Shield/Helm/Ring/Amulet are singleton types.
+- When composition is unchanged, an item/spell edit does not rebuild formation
+  from scratch. Overflow/reserve placements are preserved; only troops already
+  in their natural primary front/back lane are re-sorted by modified tactical
+  strength. This reproduces native formations for all four edited armies.
+- Armies #63/#64/#65 generated runtime bodies +0x0800..end are byte-identical
+  to Другой берег3.sav. Army #62 has exactly one native-load-only difference at
+  unit +0x18 / army +0x81C; every byte caused by the DTm artifact edit matches.
+  QuestSync deliberately preserves the source model byte for a same-role unit
+  instead of copying nondeterministic/opaque state from an independent load.
+
+Derived formulas now implemented
+================================
+
+Upkeep / payment:
+- Exact CalculateUpkeep formula from the editor.
+- Round((Cost / CostGoldDiv / CostRecruitDiv) * K) using .NET banker's rounding.
+- K = 0.25 / 0.50 / 0.75 / 1.00 for Cost <=50 / <=100 / <=150 / >150.
+- CostRecruitDiv defaults to 2 when absent/invalid; CostGoldDiv <= 0 becomes 2.
+- Level does not change upkeep. Legacy empirical payment profiles are no longer
+  used.
+
+Tactical strength / tactical cost:
+- CalculateTacticalStrength and CalculateTacticCost were reconstructed from the
+  IL of Editor1.3.10.1.exe and implemented in army_runtime.py.
+- Formula covers attack-class selection, exponential defence power, protection,
+  vampirism, initiative, magic direction and Bonus branches.
+- Native game-runtime compatibility overrides the editor's two God bonuses:
+  GodStrike +20 and GodAnger +10, as demonstrated by the supplied native SAVs.
+- Production strict mode still prefers exact native profiles for observed
+  Unit+Level and modified combinations, because a few game-runtime details do
+  not exactly equal editor calculations. Unknown combinations fail safely
+  instead of silently writing an unverified strength.
+
+Format/runtime hardening
+========================
+
+- Runtime army slot: 0x3827 bytes; unit record: 0x1DB bytes; maximum 12 units.
+- Same-count structural edits, multiple insert/delete operations and exact
+  survivor reorders are supported.
+- Middle insertion/reorder preserves +0x000..+0x7FF destination-slot header and
+  moves +0x800..end with the mapped army.
+- MapLDV V.4 Army-ID references are centralized: cell marker, building owner
+  +292 and all 16 known EventData offsets.
+- Strict post-build verifier checks slot size, unit count/composition, aggregate
+  strength, HP sum, formation and rebuilt unit-area invariants.
+- Empty-map cell-table fallback can locate the table from runtime army current
+  coordinates and cell markers; markerless/inactive 100x100 and 200x200 native
+  V.4 layouts are also supported by byte-certified geometry profiles.
+- SAV text/dynamic-tail location no longer requires the scenario-title string
+  to match the target DTm; it has a structural/text-table fallback.
+- New unit runtime marker +0x1A6 is 1 as confirmed by the native all-unit corpus.
+
+Automated tests
+===============
+
+Current automated result: 105/105 tests PASS.
+The suite additionally contains:
+- 2000 seeded exact-survivor alignment fuzz iterations;
+- 500 seeded structural alignment fuzz iterations;
+- 50 formal delete/insert property cases;
+- strict verifier corruption cases;
+- Army-ID event/cell/building remap tests;
+- artifact/spell equipment and derived-stat tests;
+- upkeep and tactical-cost checks against known native profiles.
+
+Conservative limits
+===================
+
+- DTm army records do not contain a stable GUID. A same-position delete+create
+  that leaves no exact structural anchor is observationally indistinguishable
+  from an in-place edit. The mapper intentionally chooses the conservative edit
+  interpretation in that ambiguous case.
+- For unchanged standard-game data, unseen Unit+Level or unseen modified spell/artifact combinations that require
+  synthesis are rejected by production strict mode unless a usable native runtime template exists.
+- If the live Rus_Units/Rus_Artefacts/Rus_Spells definition itself differs from the tested profile, the GUI warns that native testing was not performed and production intentionally permits the reconstructed formula fallback for that affected combination, as requested for mod compatibility.
+- Opaque AI/slot header state is preserved from the destination SAV slot rather
+  than guessed.
+
+
+BUILDING V5 NATIVE CONTROLS
+===========================
+- Objects/Objects2 no-op packed SAV: byte-identical.
+- Objects -> Objects2: 5/5 attached 14375-byte garrison states are byte-exact.
+- Building add/edit/delete/insert/reorder implemented with three-way runtime merge.
+- Barracks, market, spell/shrine and filled-garrison semantics covered.
+- Building-ID event/runtime/grid remap and strict verifier enabled.
+- Overlapping footprints are native-valid; later BuildingData wins field +5.
+- Fresh-market random stock is deterministic-valid, not expected to match an independent native RNG load byte-for-byte.
+- Automated suite at v5 packaging: 95/95 PASS.
+
+LIVE GAME-DATA V6
+=================
+- GUI startup requires Rus_Units.ini, Rus_Artefacts.ini, Rus_Spells.ini, _Global.ini and Graphics\Objects\Objects.ugs beside the application.
+- Runtime calculations use those live files. army_catalog.json is comparison/reference data only.
+- Gameplay parameter differences show a non-blocking warning; affected exact profiles are not reused and formula fallback is permitted.
+- Sync JSON records source paths and SHA-256 hashes.
+- v6 automated suite: 105/105 PASS.
+- All six available v5 end-to-end outputs remain byte-identical under the unchanged embedded reference catalog.
