@@ -12,6 +12,7 @@ from tkinter import filedialog, messagebox, ttk
 
 import dtm_sav_quest_sync as sync
 import game_resources
+import safe_sync
 
 
 class QuestSyncApp(tk.Tk):
@@ -21,7 +22,10 @@ class QuestSyncApp(tk.Tk):
         self.title("Discord Times — обновление DTm → SAV")
         self.geometry("1180x760")
         self.minsize(900, 620)
+        self._configure_window()
         self.plan: sync.SyncPlan | None = None
+        self.prepared = None
+        self.delete_event_ids = set()
 
         self.source_var = tk.StringVar()
         self.original_var = tk.StringVar()
@@ -33,6 +37,21 @@ class QuestSyncApp(tk.Tk):
         self._configure_style()
         self._build_ui()
         self.after(100, self._announce_game_data)
+
+    def _configure_window(self) -> None:
+        # PyInstaller places bundled assets in _MEIPASS; source launches keep
+        # them beside this module. Retain PhotoImage for the lifetime of Tk.
+        asset_dir = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent)) / 'assets'
+        self._window_icon = tk.PhotoImage(master=self, file=str(asset_dir / 'Icon.png'))
+        self.iconphoto(True, self._window_icon)
+        if sys.platform == 'win32':
+            self.iconbitmap(str(asset_dir / 'Icon.ico'))
+            self.state('zoomed')
+        else:
+            try:
+                self.attributes('-zoomed', True)
+            except tk.TclError:
+                self.geometry(f'{self.winfo_screenwidth()}x{self.winfo_screenheight()}+0+0')
 
     def _announce_game_data(self) -> None:
         self._log(f"Игровые данные загружены из: {self.resources.app_dir}")
@@ -118,7 +137,7 @@ class QuestSyncApp(tk.Tk):
             "Новое сохранение SAV",
             self.output_var,
             self._browse_output,
-            "Всегда новый файл; исходное сохранение приложение не перезаписывает",
+            "Название внутри SAV будет взято из имени нового файла без расширения .sav",
         )
         files.columnconfigure(1, weight=1)
 
@@ -145,6 +164,11 @@ class QuestSyncApp(tk.Tk):
 
         events_tab = ttk.Frame(self.notebook, padding=6)
         self.notebook.add(events_tab, text="События")
+        event_actions = ttk.Frame(events_tab)
+        event_actions.pack(fill='x', pady=(0, 6))
+        ttk.Button(event_actions, text='Удалить выбранное событие / отменить удаление',
+                   command=self._toggle_event_deletion).pack(side='left')
+        ttk.Label(event_actions, text='Удаление применяется только при создании нового SAV.').pack(side='left', padx=10)
         columns = ("id", "state", "modified", "action", "changes", "old_title", "new_title")
         self.tree = self._create_report_tree(
             events_tab,
@@ -282,6 +306,15 @@ class QuestSyncApp(tk.Tk):
             },
         )
 
+        blocked_tab = ttk.Frame(self.notebook, padding=6)
+        self.notebook.add(blocked_tab, text='Заблокированные изменения')
+        self.blocked_tree = self._create_report_tree(blocked_tab,
+            ('data', 'reason', 'suggestion'),
+            {'data':'Данные / изменение', 'reason':'Причина блокировки', 'suggestion':'Что можно сделать'},
+            {'data':280, 'reason':540, 'suggestion':350}, stretch={'reason', 'suggestion'})
+        self.blocked_tree.bind('<<TreeviewSelect>>', self._show_blocked_details)
+        self.blocked_details = tk.Text(blocked_tab, height=7, wrap='word', state='disabled')
+        self.blocked_details.pack(fill='x', pady=(6,0))
         self.status = tk.Text(root, height=5, wrap="word", state="disabled", font=("Consolas", 9))
         self.status.pack(fill="x", pady=(10, 0))
         self._log("Готово к выбору файлов.")
@@ -426,6 +459,8 @@ class QuestSyncApp(tk.Tk):
 
     def _invalidate_plan(self) -> None:
         self.plan = None
+        self.prepared = None
+        self.delete_event_ids.clear()
         self.convert_button.configure(state="disabled")
 
     def _busy(self, active: bool) -> None:
@@ -674,163 +709,155 @@ class QuestSyncApp(tk.Tk):
         self.notebook.tab(4, text=f"Ландшафт ({len(self.terrain_tree.get_children())})")
         self.notebook.tab(5, text=f"Декор ({len(self.decor_tree.get_children())})")
 
+    def _prepare(self):
+        source, original, modified, _ = self._paths()
+        if self.prepared and self.delete_event_ids:
+            previous = self.prepared
+            current_hash = sync.sav_tool.sha256(sync.sav_tool.read_dtm(modified))
+            if (modified.resolve() != Path(previous.plan.modified_dtm).resolve()
+                    or current_hash != previous.report['requested_modified_map_sha256']):
+                self.delete_event_ids.clear()
+                raise sync.QuestSyncError('Изменённая DTm была заменена. Повторите анализ и выберите события для удаления заново.')
+        return safe_sync.prepare_paths(source, original, modified, self.resources.objects_ugs,
+                                      delete_event_ids=self.delete_event_ids)
+
+    def _display_prepared(self, prepared):
+        self.prepared = prepared
+        self.plan = prepared.plan
+        self._fill_reports(self.plan)
+        self.blocked_tree.delete(*self.blocked_tree.get_children())
+        for i, item in enumerate(prepared.blocked):
+            self.blocked_tree.insert('', 'end', iid=str(i),
+                values=(item['data'], item['reason'], item['suggestion']))
+        self.notebook.tab(6, text=f'Заблокированные изменения ({len(prepared.blocked)})')
+        deleted = set(prepared.report['deleted_event_ids'])
+        requested = set(prepared.report['requested_deleted_event_ids'])
+        for event_id in requested:
+            row = f'event-{event_id}'
+            if self.tree.exists(row):
+                self.tree.set(row, 'action', 'удалить' if event_id in deleted else 'удаление заблокировано')
+                self.tree.item(row, tags=('selected' if event_id in deleted else 'progressed',))
+        self.summary_var.set(
+            f'Допустимых групп изменений: {len(prepared.applied)}. '
+            f'Заблокировано: {len(prepared.blocked)}. '
+            f'Событий: {self.plan.event_count} → {prepared.report["output_event_count"]}. '
+            f'Будет удалено событий: {len(deleted)}. '
+            'Результат проверен в памяти; файл ещё не записан.')
+        self.convert_button.configure(state='normal', text=(
+            '2. Сохранить без заблокированных изменений…' if prepared.blocked else '2. Создать новый SAV'))
+        for item in prepared.blocked:
+            self._log(f"ПРОПУСК: {item['data']}. Причина: {item['reason']}")
+        if prepared.blocked:
+            self.notebook.select(6)
+
+    def _show_blocked_details(self, _event=None):
+        selected = self.blocked_tree.selection()
+        text = ''
+        if selected and self.prepared:
+            item = self.prepared.blocked[int(selected[0])]
+            text = (f"{item['data']}\nИзменения: {item['changes']}\n"
+                    f"Причина: {item['reason']}\nПредложение: {item['suggestion']}")
+        self.blocked_details.configure(state='normal')
+        self.blocked_details.delete('1.0','end')
+        self.blocked_details.insert('1.0',text)
+        self.blocked_details.configure(state='disabled')
+
+    def _toggle_event_deletion(self):
+        if not self.prepared or not self.tree.selection():
+            return
+        event_id = int(self.tree.selection()[0].removeprefix('event-'))
+        editor_id = self.prepared.report['editor_event_ids'].get(event_id)
+        if editor_id is None:
+            messagebox.showinfo('Удаление из DTm',
+                'Это событие уже удалено в изменённой DTm. Для отмены восстановите его в редакторе карты.', parent=self)
+            return
+        if editor_id in self.delete_event_ids:
+            self.delete_event_ids.remove(editor_id)
+        else:
+            self.delete_event_ids.add(editor_id)
+        self.analyze()
+
+    def _confirm_partial(self, prepared, output):
+        dialog = tk.Toplevel(self)
+        dialog.title('Сохранить допустимые изменения?')
+        dialog.geometry('900x560')
+        dialog.transient(self)
+        ttk.Label(dialog, text=(f'Будет сохранено групп изменений: {len(prepared.applied)}. '
+            f'Пропущено: {len(prepared.blocked)}.\nНовый файл: {output}'),
+            wraplength=860, padding=12).pack(fill='x')
+        frame = ttk.Frame(dialog, padding=12)
+        frame.pack(fill='both',expand=True)
+        listing = tk.Text(frame, wrap='word')
+        scroll = ttk.Scrollbar(frame, command=listing.yview)
+        listing.configure(yscrollcommand=scroll.set)
+        scroll.pack(side='right',fill='y')
+        listing.pack(fill='both',expand=True)
+        for i,item in enumerate(prepared.blocked,1):
+            listing.insert('end',f"{i}. {item['data']}\nИзменения: {item['changes']}\nПричина: {item['reason']}\n{item['suggestion']}\n\n")
+        listing.configure(state='disabled')
+        answer = [False]
+        def accept():
+            answer[0] = True
+            dialog.destroy()
+        buttons = ttk.Frame(dialog,padding=12)
+        buttons.pack(fill='x')
+        ttk.Button(buttons,text='Сохранить без этих изменений',command=accept).pack(side='left')
+        ttk.Button(buttons,text='Отмена',command=dialog.destroy).pack(side='right')
+        dialog.bind('<Escape>',lambda _e:dialog.destroy())
+        dialog.grab_set()
+        self.wait_window(dialog)
+        return answer[0]
+
     def analyze(self) -> None:
         try:
-            source, original, modified, _ = self._paths()
             self._busy(True)
-            self._log("Анализ файлов…")
-            plan = sync.analyze_paths(source, original, modified, self.resources.objects_ugs)
-            self.plan = plan
-            self._fill_reports(plan)
-            changed_total = sum(
-                item.binary_changed_in_modified_map or item.text_changed_in_modified_map
-                for item in plan.decisions
-            )
-            self.summary_var.set(
-                f"Событий: {plan.event_count} → {plan.modified_event_count}. "
-                f"Уже затронуто сохранением: {len(plan.progressed)}. "
-                f"Изменено в новой DTm: {changed_total}. Будет импортировано будущих: {len(plan.selected)}. "
-                f"Клеток ландшафта: {len(plan.terrain_changes)}. "
-                f"Изменено армий: {len(plan.army_changes)}. "
-                f"Новых строений: {len(plan.building_additions)}. "
-                f"Неизвестных native-footprint профилей: {len(plan.building_navigation_unseen_profile_ids)}. "
-                f"Новых строений без runtime-core шаблона: {len(plan.building_runtime_template_missing_ids)}. "
-                f"Новых Фонарь/Events: {len(plan.lantern_additions)}. "
-                f"Изменено Фонарь/Events: {len(plan.lantern_changed_ids)}. "
-                f"Удалено Фонарь/Events: {len(plan.lantern_removed_ids)}. "
-                f"Добавлено/перемещено декораций: {len(plan.decoration_additions)}. "
-                f"Удалено/перемещено: {len(plan.decoration_removals)}. "
-                f"Изменений пройденных квестов пропущено: {len(plan.modified_progressed)}."
-            )
-            self.convert_button.configure(state="normal")
-            hero = (
-                plan.hero_replacement.decode("cp1251", "replace")
-                if plan.hero_replacement is not None else "не обнаружено"
-            )
-            self._log(f"Анализ завершён. Подстановка #HERONAME: {hero}.")
-            if plan.army_changes:
-                text_count = sum(item.text_changed for item in plan.army_changes)
-                binary_ids = [item.army_id for item in plan.army_changes if item.binary_changed]
-                if text_count:
-                    self._log(f"Изменены тексты армий: {text_count}.")
-                if binary_ids:
-                    self._log(
-                        "Будут синхронизированы runtime-изменения армий. "
-                        f"ID: {', '.join(map(str, binary_ids))}."
-                    )
-            if plan.building_additions:
-                ids = ", ".join(str(item.index + 1) for item in plan.building_additions)
-                self._log(f"Будут добавлены строения: {ids}.")
-            if plan.building_navigation_unseen_profile_ids:
-                ids = ", ".join(map(str, plan.building_navigation_unseen_profile_ids))
-                self._log(
-                    "ВНИМАНИЕ: для строений ID " + ids
-                    + " exact navigation-footprint не наблюдался в исходном SAV; "
-                      "будет использован прямоугольный fallback size_x×size_y."
-                )
-            if plan.building_runtime_template_missing_ids:
-                ids = ", ".join(map(str, plan.building_runtime_template_missing_ids))
-                self._log(
-                    "ВНИМАНИЕ: для новых строений ID " + ids
-                    + " нет runtime-core шаблона того же типа в исходном SAV; "
-                      "opaque bytes не считаются byte-certified."
-                )
-            if plan.lantern_additions:
-                ids = ", ".join(str(item.lantern_id) for item in plan.lantern_additions)
-                self._log(f"Будут добавлены Фонарь/Events: {ids}.")
-            if plan.lantern_changed_ids:
-                self._log(f"Будут изменены Фонарь/Events ID: {', '.join(map(str, plan.lantern_changed_ids))}.")
-            if plan.lantern_removed_ids:
-                self._log(f"Будут удалены Фонарь/Events ID: {', '.join(map(str, plan.lantern_removed_ids))}.")
-            if plan.decoration_additions:
-                ids = ", ".join(str(item.object_id) for item in plan.decoration_additions)
-                self._log(f"Будут добавлены или перемещены декорации Objects.ugs: {ids}.")
-                self._log("Визуальный цвет декораций пока рассчитывается экспериментально.")
-            if plan.decoration_removals:
-                ids = ", ".join(str(item.object_id) for item in plan.decoration_removals)
-                self._log(f"Будут удалены или перемещены старые декорации: {ids}.")
-            if plan.terrain_changes:
-                self._log(f"Будет изменено клеток ландшафта: {len(plan.terrain_changes)}.")
-            self._log("Зелёные строки будут перенесены; красные останутся из исходного SAV.")
+            self._log('Анализ и проверка допустимых изменений…')
+            prepared = self._prepare()
+            self._display_prepared(prepared)
+            self._log('Проверка завершена. Исходные файлы не изменены.')
         except Exception as exc:
             self._invalidate_plan()
-            self.summary_var.set("Анализ не выполнен.")
-            self._log(f"ОШИБКА: {exc}")
-            messagebox.showerror("Ошибка анализа", str(exc), parent=self)
+            self.summary_var.set('Анализ не выполнен.')
+            self._log(f'ОШИБКА: {exc}')
+            messagebox.showerror('Ошибка анализа',str(exc),parent=self)
         finally:
             self._busy(False)
 
     def convert(self) -> None:
         try:
-            source, original, modified, output = self._paths()
+            _, _, _, output = self._paths()
             self._busy(True)
-            plan = sync.analyze_paths(source, original, modified, self.resources.objects_ugs)
-            if not messagebox.askyesno(
-                "Создать сохранение?",
-                (
-                    f"Будет импортировано будущих событий: {len(plan.selected)}.\n"
-                    f"Будет изменено клеток ландшафта: {len(plan.terrain_changes)}.\n"
-                    f"Будет синхронизировано армий: {len(plan.army_changes)}.\n"
-                    f"Будет добавлено строений: {len(plan.building_additions)}.\n"
-                    f"Footprint fallback: {len(plan.building_navigation_unseen_profile_ids)} строений.\n"
-                    f"Без runtime-core шаблона: {len(plan.building_runtime_template_missing_ids)} строений.\n"
-                    f"Будет добавлено Фонарь/Events: {len(plan.lantern_additions)}.\n"
-                    f"Будет изменено Фонарь/Events: {len(plan.lantern_changed_ids)}.\n"
-                    f"Будет удалено Фонарь/Events: {len(plan.lantern_removed_ids)}.\n"
-                    f"Будет добавлено/перемещено декораций: {len(plan.decoration_additions)}.\n"
-                    f"Будет удалено/перемещено старых декораций: {len(plan.decoration_removals)}.\n"
-                    f"Событий с сохранённым прогрессом: {len(plan.progressed)}.\n\n"
-                    "Игровой прогресс существующих армий сохраняется консервативно; изменяются только поля, "
-                    "которые всё ещё соответствуют исходной DTm, и необходимые структурные ссылки.\n"
-                    "Остальной динамический прогресс SAV не изменяется.\n"
-                    f"Новый файл:\n{output}"
-                    + self._profile_warning_suffix()
-                ),
-                parent=self,
-            ):
+            prepared = self._prepare()
+            self._display_prepared(prepared)
+            if prepared.blocked:
+                if not self._confirm_partial(prepared, output):
+                    return
+            elif not messagebox.askyesno('Создать сохранение?',
+                f'Допустимых групп изменений: {len(prepared.applied)}.\n'
+                f'Удаляемых событий: {len(prepared.report["deleted_event_ids"])}.\n'
+                f'Новый файл: {output}'+self._profile_warning_suffix(),parent=self):
                 return
             overwrite = False
-            if output.exists():
-                overwrite = messagebox.askyesno(
-                    "Файл существует",
-                    f"Перезаписать выходной файл?\n{output}",
-                    parent=self,
-                )
+            report_path = output.with_suffix(output.suffix+'.sync.json')
+            if output.exists() or (self.write_report_var.get() and report_path.exists()):
+                overwrite = messagebox.askyesno('Файл существует',
+                    f'Перезаписать существующий результат и отчёт?\n{output}',parent=self)
                 if not overwrite:
                     return
-            self._log("Создание нового SAV…")
-            report = sync.convert_plan(
-                plan,
-                output,
-                write_report=self.write_report_var.get(),
-                allow_overwrite=overwrite,
-            )
-            self.plan = plan
-            self._log(f"Готово: {output}")
-            self._log(f"SHA-256: {report['output_sha256']}")
-            if report.get("report_file"):
-                self._log(f"Отчёт: {report['report_file']}")
-            messagebox.showinfo(
-                "Готово",
-                (
-                    "Новое сохранение создано и проверено.\n\n"
-                    f"Перенесено будущих событий: {len(plan.selected)}\n"
-                    f"Изменено клеток ландшафта: {len(plan.terrain_changes)}\n"
-                    f"Синхронизировано армий: {len(plan.army_changes)}\n"
-                    f"Добавлено строений: {len(plan.building_additions)}\n"
-                    f"Добавлено Фонарь/Events: {len(plan.lantern_additions)}\n"
-                    f"Изменено Фонарь/Events: {len(plan.lantern_changed_ids)}\n"
-                    f"Удалено Фонарь/Events: {len(plan.lantern_removed_ids)}\n"
-                    f"Добавлено/перемещено декораций: {len(plan.decoration_additions)}\n"
-                    f"Удалено/перемещено старых декораций: {len(plan.decoration_removals)}\n"
-                    f"Сохранено затронутых событий: {len(plan.progressed)}\n"
-                    f"Файл: {output}"
-                ),
-                parent=self,
-            )
+            report = safe_sync.save_prepared(prepared,output,accept_partial=bool(prepared.blocked),
+                write_report=self.write_report_var.get(),allow_overwrite=overwrite)
+            self._log(f'Готово: {output}\nSHA-256: {report["output_sha256"]}')
+            self._log(f'Название сохранения в игре: {report["save_name"]}')
+            if report.get('report_status') == 'failed':
+                messagebox.showwarning('SAV создан, отчёт не записан',
+                    f'{output}\n{report["report_error"]}',parent=self)
+            else:
+                messagebox.showinfo('Готово',
+                    f'Новое сохранение создано.\nПропущено групп изменений: {len(prepared.blocked)}.\n'
+                    f'Удалено событий: {len(report["deleted_event_ids"])}.\n{output}',parent=self)
         except Exception as exc:
-            self._log(f"ОШИБКА: {exc}")
-            messagebox.showerror("Ошибка создания SAV", str(exc), parent=self)
+            self._log(f'ОШИБКА: {exc}')
+            messagebox.showerror('Ошибка создания SAV',str(exc),parent=self)
         finally:
             self._busy(False)
 
@@ -838,7 +865,7 @@ class QuestSyncApp(tk.Tk):
         for variable in (self.source_var, self.original_var, self.modified_var, self.output_var):
             variable.set("")
         self._invalidate_plan()
-        for tree in (self.tree, self.building_tree, self.army_tree, self.lantern_tree, self.terrain_tree, self.decor_tree):
+        for tree in (self.tree, self.building_tree, self.army_tree, self.lantern_tree, self.terrain_tree, self.decor_tree, self.blocked_tree):
             tree.delete(*tree.get_children())
         self._set_event_details("")
         self.notebook.tab(0, text="События")
@@ -847,6 +874,8 @@ class QuestSyncApp(tk.Tk):
         self.notebook.tab(3, text="Фонарь/Events")
         self.notebook.tab(4, text="Ландшафт")
         self.notebook.tab(5, text="Декор")
+        self.notebook.tab(6, text="Заблокированные изменения")
+        self._show_blocked_details()
         self.summary_var.set("Выберите четыре файла и нажмите «Анализировать».")
         self._log("Поля очищены.")
 

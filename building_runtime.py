@@ -420,8 +420,15 @@ def synthesize_garrison_state(
     if old_record is not None and source_state is not None:
         # Composition may be damaged/depleted only in runtime; refuse a semantic
         # rewrite if the source no longer corresponds to the original DTm.
-        if old_native != old_record.garrison and old_record.garrison != record.garrison:
-            raise ValueError("Текущий runtime-гарнизон уже отличается от исходной DTm; состав нельзя безопасно заменить")
+        if old_native != old_record.garrison:
+            raise ValueError("Гарнизон уже изменился в игре (потери или уровни). Изменение его состава, защиты или добычи остановлено, чтобы сохранить прогресс.")
+        # Compare the fields this synthesizer would overwrite. Opaque fields
+        # survive in the baseline because source records remain its templates.
+        baseline = synthesize_garrison_state(
+            old_record, catalog, source_state=source_state, strict=strict
+        )
+        if baseline != source_state:
+            raise ValueError("Гарнизон содержит игровой прогресс (HP, состояние или добыча). Его пересборка остановлена, чтобы не восстановить потери и не сбросить состояние.")
 
     # Preserve matching unit templates/opaque progress where possible.
     old_records = []

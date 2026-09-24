@@ -396,6 +396,8 @@ def decode_surface(
         raise QuestSyncError("RLE-секция ландшафта имеет нечётный размер.")
     decoded = bytearray()
     for value, run_minus_one in zip(encoded[0::2], encoded[1::2]):
+        if len(decoded) + run_minus_one + 1 > expected_cells:
+            raise QuestSyncError('RLE-ландшафт превышает заявленное количество клеток.')
         decoded.extend(bytes((value,)) * (run_minus_one + 1))
     if len(decoded) != expected_cells:
         raise QuestSyncError(
@@ -688,6 +690,7 @@ def infer_cell_table(
             # two layouts are byte-certified by native 100x100 and 200x200
             # saves.  Refuse unknown geometry rather than extrapolating.
             known_empty_bases = {
+                (50, 50): 24701,
                 (100, 100): 90740,
                 (200, 200): 377540,
             }
@@ -698,7 +701,7 @@ def infer_cell_table(
             if (
                 fallback is not None
                 and original.startswith(b"MapLDV V.4\r\n")
-                and len(values) == 19 * width * height
+                and len(values) * 2 == sav_tool.compiled_grid_profile(width, height)['cell_layers_size']
                 and last_index is not None
                 and last_index < len(values)
             ):
@@ -774,6 +777,13 @@ def infer_decoration_grid_layout(
     cell_count = width * height
     ring_size = cell_count + 4
     visual_stride = width + 4
+    if (width, height) == (50, 50):
+        # Measured from all 31 building / 54 lantern anchors and 2500 terrain
+        # cells in the native control. C begins at window word 0, A/B at
+        # 2504/5008. These are complete linear layers, not wrapped fragments.
+        if cell_table_base_u16 != 24701 or cell_layer_u16_count < 54980:
+            raise QuestSyncError('Карта 50×50 не соответствует проверенному расположению клеточных слоёв.')
+        return ring_size, 2504, 20534, visual_stride
     visual_base = cell_table_base_u16 - (3 * cell_count // 2 + 8 * width + 17)
     rotation = (visual_base - 7 * cell_count - 10 * width - 30) % ring_size
     if 2 * ring_size > cell_layer_u16_count:
@@ -1519,10 +1529,16 @@ def analyze_paths(
     source_sav = Path(source_sav)
     original_dtm = Path(original_dtm)
     modified_dtm = Path(modified_dtm)
-    save_raw = source_sav.read_bytes()
+    save_raw = sav_tool.read_bounded(source_sav)
     payload, container_info = sav_tool.unpack_sav_bytes(save_raw)
     original = sav_tool.read_dtm(original_dtm)
     modified = sav_tool.read_dtm(modified_dtm)
+    return analyze_data(source_sav, original_dtm, modified_dtm, save_raw, original, modified, objects_ugs)
+
+
+def analyze_data(source_sav, original_dtm, modified_dtm, save_raw, original, modified, objects_ugs=None):
+    """Analyze an immutable input snapshot, including a filtered in-memory DTm."""
+    payload, container_info = sav_tool.unpack_sav_bytes(save_raw)
     original_sections, _ = sav_tool.dtm_layout(original)
     modified_sections, _ = sav_tool.dtm_layout(modified)
     validate_compatible_maps(original, modified, original_sections, modified_sections)
@@ -2029,6 +2045,15 @@ def plan_summary(plan: SyncPlan, include_events: bool = True) -> dict[str, Any]:
 
 def build_synced_payload(plan: SyncPlan) -> tuple[bytes, dict[str, Any]]:
     payload = bytearray(plan.payload)
+    property_a_base = dict(PROPERTY_A_TERRAIN_BASE)
+    property_b_base = dict(PROPERTY_B_TERRAIN_BASE)
+    property_c_base = PROPERTY_C_TERRAIN_BASE
+    if (plan.width, plan.height) == (50, 50):
+        # Native compact-map layers: rough land uses the full walking cost
+        # in A and is impassable in B. C keeps the unscaled terrain cost.
+        for tile in (8, 10, 11, 12, 13, 14):
+            property_a_base[tile] = PROPERTY_B_TERRAIN_BASE[tile]
+            property_b_base[tile] = 0
 
     old_building_records_raw = [
         _building_record(plan.original_inner, plan.original_sections["buildings"], i)
@@ -2140,6 +2165,12 @@ def build_synced_payload(plan: SyncPlan) -> tuple[bytes, dict[str, Any]]:
         for off in building_runtime.HERO_START_BUILDING_OFFSETS:
             payload[plan.map_header_offset + off] = plan.modified_inner[off]
 
+    # Victory/defeat event references are explicit editor settings, not live
+    # event state. They must follow the effective event namespace.
+    for off in (210, 216):
+        if plan.original_inner[off:off+2] != plan.modified_inner[off:off+2]:
+            payload[plan.map_header_offset+off:plan.map_header_offset+off+2] = plan.modified_inner[off:off+2]
+
     grid_offset = plan.relationship["compiled_grid"]["offset"]
     grid_end = grid_offset + plan.relationship["compiled_grid"]["cell_layers_size"]
     surface = decode_surface(
@@ -2161,6 +2192,8 @@ def build_synced_payload(plan: SyncPlan) -> tuple[bytes, dict[str, Any]]:
         struct.pack_into("<H", payload, grid_u16_offset(index), value)
 
     def property_index(grid_number: int, x: int, y: int) -> int:
+        if (plan.width, plan.height) == (50, 50):
+            return terrain_property_index(grid_number, x, y)
         return (
             grid_number * plan.property_ring_size_u16
             + (
@@ -2189,6 +2222,8 @@ def build_synced_payload(plan: SyncPlan) -> tuple[bytes, dict[str, Any]]:
             if grid_number == 1
             else PROPERTY_C_BASE_VALUES
         ).get(tile_id, frozenset())
+        if (plan.width, plan.height) == (50, 50):
+            expected_values = frozenset(((property_a_base, property_b_base, property_c_base)[grid_number][tile_id],))
         if value not in expected_values:
             return value
         if not item.passable:
@@ -2312,6 +2347,8 @@ def build_synced_payload(plan: SyncPlan) -> tuple[bytes, dict[str, Any]]:
                 if new_id != old_id:
                     struct.pack_into("<H", payload, marker_off, army_runtime.encode_army_cell_marker(new_id)[0])
 
+    army_marker_expectations: dict[int, tuple[int, int, bool]] = {}
+
     def set_army_marker(x: int, y: int, army_id: int, enabled: bool) -> None:
         if not (0 <= x < plan.width and 0 <= y < plan.height):
             raise QuestSyncError(f"Координаты армии {army_id} выходят за карту: ({x}, {y}).")
@@ -2324,11 +2361,14 @@ def build_synced_payload(plan: SyncPlan) -> tuple[bytes, dict[str, Any]]:
             if (marker, kind) in ((0, 0), (expected, army_kind)):
                 struct.pack_into("<H", payload, marker_off, expected)
                 struct.pack_into("<H", payload, kind_off, army_kind)
+            else:
+                raise QuestSyncError(f"Клетка ({x}, {y}) для армии {army_id} уже занята; перенос остановлен.")
         elif marker == expected and kind == army_kind:
             struct.pack_into("<H", payload, marker_off, 0)
             struct.pack_into("<H", payload, kind_off, 0)
+        army_marker_expectations[army_id] = (x, y, enabled)
 
-    if source_army_blocks:
+    if source_army_blocks or plan.army_count == 0:
         for target_index, new_rec in enumerate(new_army_records):
             new_id = target_index + 1
             source_index = army_mapping[target_index] if target_index < len(army_mapping) else None
@@ -2346,9 +2386,8 @@ def build_synced_payload(plan: SyncPlan) -> tuple[bytes, dict[str, Any]]:
             if not (active_changed or pos_changed):
                 continue
             can_change_active = current_active == (1 - old_rec.activity)
-            can_change_pos = (current_x, current_y) == (old_rec.x, old_rec.y)
             desired_active = (1 - new_rec.activity) if (active_changed and can_change_active) else current_active
-            desired_x, desired_y = (new_rec.x, new_rec.y) if (pos_changed and can_change_pos) else (current_x, current_y)
+            desired_x, desired_y = army_runtime.merged_position((current_x, current_y), old_rec, new_rec)
             if (desired_active != current_active) or (desired_x, desired_y) != (current_x, current_y):
                 set_army_marker(current_x, current_y, new_id, False)
                 if desired_active == 1:
@@ -2395,12 +2434,12 @@ def build_synced_payload(plan: SyncPlan) -> tuple[bytes, dict[str, Any]]:
             decoration_visual_writes += 1
 
         property_targets = [
-            (terrain_property_index(0, change.x, change.y), PROPERTY_A_TERRAIN_BASE),
-            (terrain_property_index(1, change.x, change.y), PROPERTY_B_TERRAIN_BASE),
+            (terrain_property_index(0, change.x, change.y), property_a_base),
+            (terrain_property_index(1, change.x, change.y), property_b_base),
         ]
         c_index = property_targets[0][0] - plan.property_ring_size_u16
         if c_index >= 0:
-            property_targets.append((c_index, PROPERTY_C_TERRAIN_BASE))
+            property_targets.append((c_index, property_c_base))
         navigation_value = struct.unpack_from(
             "<H", payload, cell_field_offset(change.x, change.y, 5)
         )[0]
@@ -2427,8 +2466,8 @@ def build_synced_payload(plan: SyncPlan) -> tuple[bytes, dict[str, Any]]:
         for x, y in sorted(reset_cells):
             tile_id = surface[x + plan.width * y]
             for grid_number, bases in (
-                (0, PROPERTY_A_TERRAIN_BASE),
-                (1, PROPERTY_B_TERRAIN_BASE),
+                (0, property_a_base),
+                (1, property_b_base),
             ):
                 index = terrain_property_index(grid_number, x, y)
                 before = grid_u16(index)
@@ -2558,9 +2597,9 @@ def build_synced_payload(plan: SyncPlan) -> tuple[bytes, dict[str, Any]]:
             a_index = terrain_property_index(0, x, y)
             b_index = terrain_property_index(1, x, y)
             c_index = a_index - plan.property_ring_size_u16
-            set_building_property(c_index, PROPERTY_C_TERRAIN_BASE[tile_id])
-            set_building_property(a_index, PROPERTY_A_TERRAIN_BASE[tile_id])
-            set_building_property(b_index, PROPERTY_B_TERRAIN_BASE[tile_id])
+            set_building_property(c_index, property_c_base[tile_id])
+            set_building_property(a_index, property_a_base[tile_id])
+            set_building_property(b_index, property_b_base[tile_id])
 
         if plan.objects_ugs is None:
             raise QuestSyncError(
@@ -2846,6 +2885,10 @@ def build_synced_payload(plan: SyncPlan) -> tuple[bytes, dict[str, Any]]:
             synced_tail = army_runtime.sync_army_tail(
                 source_tail, old_army_records, new_army_records, army_mapping, catalog
             )
+            synced_tail = army_runtime.sync_army_cell_indices(
+                source_tail, synced_tail, army_mapping, plan.army_count,
+                plan.cell_table_stride,
+            )
         except (ValueError, struct.error) as exc:
             raise QuestSyncError(f"Не удалось перестроить runtime армий: {exc}") from exc
     else:
@@ -2897,6 +2940,15 @@ def build_synced_payload(plan: SyncPlan) -> tuple[bytes, dict[str, Any]]:
         raise QuestSyncError(f"Финальная структура SAV после синхронизации строений не распознана: {exc}") from exc
 
     final_event_start = final_relation["events"]["offset"]
+    for army_id, (x, y, enabled) in army_marker_expectations.items():
+        if not enabled:
+            continue
+        block = synced_tail[army_id * army_runtime.RUNTIME_ARMY_SIZE:(army_id + 1) * army_runtime.RUNTIME_ARMY_SIZE]
+        runtime_xy = tuple(struct.unpack_from('<I', block, off)[0] for off in (army_runtime.CURRENT_X_OFF, army_runtime.CURRENT_Y_OFF))
+        marker = struct.unpack_from('<H', new_payload, cell_field_offset(x, y, 3))[0]
+        kind = struct.unpack_from('<H', new_payload, cell_field_offset(x, y, 4))[0]
+        if runtime_xy != (x, y) or (marker, kind) != army_runtime.encode_army_cell_marker(army_id):
+            raise QuestSyncError(f'Армия {army_id}: runtime-позиция и клеточный маркер не согласованы.')
     for event_index in range(plan.modified_event_count):
         record = new_payload[final_event_start + event_index * EVENT_SIZE:final_event_start + (event_index + 1) * EVENT_SIZE]
         for off in (30, 31, 32):
@@ -2959,7 +3011,7 @@ def build_synced_payload(plan: SyncPlan) -> tuple[bytes, dict[str, Any]]:
     return new_payload, report
 
 
-def atomic_write(path: Path, data: bytes) -> None:
+def atomic_write(path: Path, data: bytes, *, overwrite: bool = True) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
@@ -2968,7 +3020,13 @@ def atomic_write(path: Path, data: bytes) -> None:
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temp_name, path)
+        if overwrite:
+            os.replace(temp_name, path)
+        else:
+            # Atomic no-clobber publication, including a file created after
+            # convert_plan's preflight check.
+            os.link(temp_name, path)
+            os.unlink(temp_name)
     except BaseException:
         try:
             os.unlink(temp_name)
@@ -2983,23 +3041,44 @@ def convert_plan(
     *,
     write_report: bool = True,
     allow_overwrite: bool = False,
+    prepared_result: tuple[bytes, dict[str, Any]] | None = None,
+    save_name: str | None = None,
 ) -> dict[str, Any]:
     output_sav = Path(output_sav)
-    try:
-        if output_sav.resolve() == plan.source_sav.resolve():
-            raise QuestSyncError("Нельзя перезаписывать исходное сохранение. Выберите новый файл.")
-    except OSError:
-        pass
+    report_path = output_sav.with_suffix(output_sav.suffix + '.sync.json')
+    protected = [Path(plan.source_sav), Path(plan.original_dtm), Path(plan.modified_dtm)]
+    if getattr(plan, 'objects_ugs', None) is not None:
+        protected.append(Path(plan.objects_ugs))
+    protected.extend(Path(p) for p in army_runtime.load_catalog().get('_game_data', {}).get('files', {}).values())
+    destinations = [output_sav]
+    if write_report:
+        destinations.append(report_path)
+    for destination in destinations:
+        for source in protected:
+            same = destination.resolve() == source.resolve()
+            if not same and destination.exists() and source.exists():
+                same = destination.samefile(source)
+            if same:
+                raise QuestSyncError(f'Нельзя перезаписывать входной файл: {source}. Выберите другой выходной путь.')
+        if destination.exists():
+            if not destination.is_file():
+                raise QuestSyncError(f'Выходной путь не является файлом: {destination}')
+            if not allow_overwrite:
+                raise QuestSyncError(f'Выходной файл уже существует: {destination}')
     if output_sav.exists() and not allow_overwrite:
         raise QuestSyncError(f"Выходной файл уже существует: {output_sav}")
 
-    payload, report = build_synced_payload(plan)
+    payload, report = prepared_result if prepared_result is not None else build_synced_payload(plan)
+    report = dict(report)
+    if save_name is not None:
+        report['source_save_name'] = sav_tool.save_metadata(payload)['slot_name']
+        payload = sav_tool.rename_save_slot(payload, save_name)
+        report.update(save_name=save_name, output_payload_size=len(payload),
+                      output_payload_sha256=sav_tool.sha256(payload))
     packed = sav_tool.pack_sav_bytes(payload, plan.save_raw[4:8])
     verified_payload, verified_info = sav_tool.unpack_sav_bytes(packed)
     if verified_payload != payload:
         raise QuestSyncError("Внутренняя проверка упаковки SAV не пройдена.")
-    atomic_write(output_sav, packed)
-
     report.update(
         {
             "output_sav": str(output_sav),
@@ -3007,32 +3086,53 @@ def convert_plan(
             "output_sha256": sav_tool.sha256(packed),
             "verified_chunk_count": verified_info["chunk_count"],
             "container_roundtrip_verified": True,
+            "output_status": "written",
+            "report_status": "written" if write_report else "disabled",
         }
     )
+    # Serialize before committing the SAV: a JSON error must not leave a
+    # successful save disguised as a failed conversion.
+    report_bytes = (json.dumps(report, ensure_ascii=False, indent=2) + '\n').encode('utf-8') if write_report else None
+    atomic_write(output_sav, packed, overwrite=allow_overwrite)
     if write_report:
-        report_path = output_sav.with_suffix(output_sav.suffix + ".sync.json")
-        atomic_write(
-            report_path,
-            (json.dumps(report, ensure_ascii=False, indent=2) + "\n").encode("utf-8"),
-        )
-        report["report_file"] = str(report_path)
+        try:
+            atomic_write(report_path, report_bytes, overwrite=allow_overwrite)
+        except OSError as exc:
+            report['report_status'] = 'failed'
+            report['report_error'] = str(exc)
+            report['report_attempted_path'] = str(report_path)
+        else:
+            report["report_file"] = str(report_path)
     return report
 
 
 def command_analyze(args: argparse.Namespace) -> None:
-    plan = analyze_paths(args.save, args.original, args.modified, args.objects_ugs)
-    text = json.dumps(plan_summary(plan, include_events=not args.summary_only), ensure_ascii=False, indent=2)
+    import safe_sync
+    prepared = safe_sync.prepare_paths(args.save, args.original, args.modified, args.objects_ugs,
+                                       delete_event_ids=args.delete_event)
+    report = dict(prepared.report)
+    if args.summary_only:
+        report.pop('events', None)
+    text = json.dumps(report, ensure_ascii=False, indent=2)
     if args.output:
-        args.output.write_text(text + "\n", encoding="utf-8")
+        # Analysis is read-only with respect to the inputs and existing files.
+        atomic_write(args.output, (text + '\n').encode('utf-8'), overwrite=False)
     else:
         print(text)
 
 
 def command_convert(args: argparse.Namespace) -> None:
-    plan = analyze_paths(args.save, args.original, args.modified, args.objects_ugs)
-    report = convert_plan(
-        plan,
+    import safe_sync
+    prepared = safe_sync.prepare_paths(args.save, args.original, args.modified, args.objects_ugs,
+                                       delete_event_ids=args.delete_event)
+    if prepared.blocked and not args.skip_blocked:
+        print(json.dumps({'blocked_changes':prepared.blocked,
+                          'suggestion':'Повторите с --skip-blocked, чтобы сохранить без перечисленных изменений.'},
+                         ensure_ascii=False, indent=2))
+    report = safe_sync.save_prepared(
+        prepared,
         args.output,
+        accept_partial=args.skip_blocked,
         write_report=not args.no_report,
         allow_overwrite=args.overwrite,
     )
@@ -3047,6 +3147,8 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--save", type=Path, required=True, help="source SAV")
         p.add_argument("--original", type=Path, required=True, help="original DTm used by SAV")
         p.add_argument("--modified", type=Path, required=True, help="modified DTm")
+        p.add_argument('--delete-event', type=int, action='append', default=[],
+                       help='event ID in modified DTm to delete; repeat for several events')
         p.add_argument(
             "--objects-ugs",
             type=Path,
@@ -3060,6 +3162,7 @@ def build_parser() -> argparse.ArgumentParser:
             p.add_argument("--output", type=Path, required=True, help="new SAV")
             p.add_argument("--overwrite", action="store_true")
             p.add_argument("--no-report", action="store_true")
+            p.add_argument('--skip-blocked', action='store_true', help='explicitly accept the verified partial result')
             p.set_defaults(func=command_convert)
     return parser
 
@@ -3075,7 +3178,7 @@ def main() -> int:
         game_resources.install_game_resources(resources)
         args.objects_ugs = resources.objects_ugs
         args.func(args)
-    except (OSError, QuestSyncError, sav_tool.SavError, struct.error, game_resources.GameDataError) as exc:
+    except (OSError, ValueError, struct.error, game_resources.GameDataError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     return 0

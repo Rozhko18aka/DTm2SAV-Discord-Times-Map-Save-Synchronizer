@@ -30,6 +30,10 @@ SAV_DEFAULT_TAG = b"\x40\x00\x11\xe2"
 DTM_MAGIC = b"AIpf\r\n\x13\x00"
 MAP_MAGIC = b"MapLDV V.4\r\n"
 CHUNK_SIZE = 65536
+MAX_FILE_BYTES = 128 * 1024 * 1024
+MAX_SAV_BYTES = 256 * 1024 * 1024
+MAX_DTM_BYTES = 64 * 1024 * 1024
+MAX_MAP_DIMENSION = 1024
 RUNTIME_ARMY_SIZE = 14375
 MAP_PREFIX_SIZE = 289
 DTM_SECTION_BASE = 0x12F
@@ -46,6 +50,75 @@ SECTION_SPECS = (
 
 class SavError(ValueError):
     pass
+
+
+def read_bounded(path: Path, limit: int = MAX_FILE_BYTES) -> bytes:
+    with Path(path).open('rb') as stream:
+        # Avoid allocating the entire safety budget for a small input file.
+        chunks = []
+        total = 0
+        while total <= limit:
+            chunk = stream.read(min(65536, limit + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        data = b''.join(chunks)
+    if len(data) > limit:
+        raise SavError(f'input exceeds {limit} bytes: {path}')
+    return data
+
+
+def decompress_bounded(data: bytes, limit: int, label: str) -> bytes:
+    """One complete BZip2 stream, with a hard output budget."""
+    decoder = bz2.BZ2Decompressor()
+    try:
+        result = decoder.decompress(data, max_length=limit + 1)
+    except (OSError, EOFError, ValueError) as exc:
+        raise SavError(f'{label}: invalid BZip2 stream: {exc}') from exc
+    if len(result) > limit or not decoder.needs_input and not decoder.eof:
+        raise SavError(f'{label}: decompressed data exceeds {limit} bytes')
+    if not decoder.eof:
+        raise SavError(f'{label}: truncated BZip2 stream')
+    if decoder.unused_data:
+        raise SavError(f'{label}: trailing data or concatenated BZip2 streams')
+    return result
+
+
+def validate_map_geometry(inner: bytes) -> tuple[int, int]:
+    if len(inner) < DTM_SECTION_BASE or not inner.startswith(MAP_MAGIC):
+        raise SavError('bad or truncated MapLDV V.4 stream')
+    width, height = struct.unpack_from('<II', inner, 12)
+    if not (0 < width <= MAX_MAP_DIMENSION and 0 < height <= MAX_MAP_DIMENSION):
+        raise SavError(f'unsupported map dimensions: {width}x{height}')
+    return width, height
+
+
+def compiled_grid_profile(width: int, height: int) -> dict[str, Any]:
+    """Bounded editable grid window. Offsets are relative to the map header.
+
+    Native 50x50 control (Quiet Harbour) places C/A/B before the old fixed
+    14375-byte opaque prefix. Start its window at C, and end before counts;
+    never reinterpret those property words as an army runtime block.
+    """
+    if (width, height) == (50, 50):
+        return {
+            'initial_state_size': 2153,
+            'grid_size': 109976,
+            'cell_layers_size': 109960,
+            'tail_size': 16,
+            'formula': 'native MapLDV V.4 50x50: C/A/B + visual + terrain + cell table + counts',
+            'layers': None,
+        }
+    cells = width * height
+    return {
+        'initial_state_size': RUNTIME_ARMY_SIZE,
+        'grid_size': 38 * cells + 24 * width + 9054,
+        'cell_layers_size': 38 * cells,
+        'tail_size': 24 * width + 9054,
+        'formula': '38*width*height + 24*width + 9054',
+        'layers': 19,
+    }
 
 
 def u32(data: bytes, offset: int) -> int:
@@ -75,12 +148,17 @@ def read_cstrings_raw(data: bytes, offset: int, count: int) -> tuple[list[bytes]
 
 
 def unpack_sav_bytes(raw: bytes) -> tuple[bytes, dict[str, Any]]:
+    if len(raw) > MAX_FILE_BYTES:
+        raise SavError('compressed SAV exceeds input size limit')
     if len(raw) < 16 or raw[:4] != SAV_MAGIC:
         raise SavError("not an AEpf save")
     declared = u32(raw, 8)
+    if not 0 < declared <= MAX_SAV_BYTES:
+        raise SavError('SAV declared size is zero or exceeds the size limit')
     pos = 12
     chunks = []
     parts = []
+    produced = 0
     while pos < len(raw):
         if pos + 4 > len(raw):
             raise SavError(f"truncated chunk length at 0x{pos:X}")
@@ -93,10 +171,14 @@ def unpack_sav_bytes(raw: bytes) -> tuple[bytes, dict[str, Any]]:
         compressed = raw[pos:end]
         if not compressed.startswith(b"BZh1"):
             raise SavError(f"chunk at 0x{pos:X} is not BZip2 level 1")
-        try:
-            unpacked = bz2.decompress(compressed)
-        except OSError as exc:
-            raise SavError(f"bad BZip2 chunk at 0x{pos:X}: {exc}") from exc
+        if produced >= declared:
+            raise SavError('extra SAV chunk after declared data')
+        unpacked = decompress_bounded(compressed, min(CHUNK_SIZE, declared - produced), f'chunk at 0x{pos:X}')
+        if not unpacked:
+            raise SavError('empty SAV chunk')
+        produced += len(unpacked)
+        if end < len(raw) and len(unpacked) != CHUNK_SIZE:
+            raise SavError('non-final save chunk is not 64 KiB')
         chunks.append(
             {
                 "index": len(chunks),
@@ -129,6 +211,8 @@ def unpack_sav_bytes(raw: bytes) -> tuple[bytes, dict[str, Any]]:
 
 
 def pack_sav_bytes(payload: bytes, tag: bytes = SAV_DEFAULT_TAG) -> bytes:
+    if not 0 < len(payload) <= MAX_SAV_BYTES:
+        raise SavError('SAV payload is empty or exceeds size limit')
     if len(tag) != 4:
         raise SavError("save tag must be exactly four bytes")
     result = bytearray(SAV_MAGIC + tag + struct.pack("<I", len(payload)))
@@ -140,23 +224,26 @@ def pack_sav_bytes(payload: bytes, tag: bytes = SAV_DEFAULT_TAG) -> bytes:
 
 
 def read_dtm(path: Path) -> bytes:
-    raw = path.read_bytes()
+    raw = read_bounded(path, MAX_DTM_BYTES)
     if raw.startswith(DTM_MAGIC):
         if len(raw) < 16 or raw[12:16] != b"BZh9":
             raise SavError("bad AIpf/BZip2 map wrapper")
-        inner = bz2.decompress(raw[12:])
-        if len(inner) != u32(raw, 8):
+        declared = u32(raw, 8)
+        if not DTM_SECTION_BASE <= declared <= MAX_DTM_BYTES:
+            raise SavError('map declared size is invalid or exceeds the size limit')
+        inner = decompress_bounded(raw[12:], declared, 'map')
+        if len(inner) != declared:
             raise SavError("map unpacked-size field does not match")
     elif raw.startswith(MAP_MAGIC):
         inner = raw
     else:
         raise SavError("not an AIpf .DTm or unpacked MapLDV V.4 stream")
-    if not inner.startswith(MAP_MAGIC) or len(inner) < DTM_SECTION_BASE:
-        raise SavError("bad or truncated MapLDV V.4 stream")
+    validate_map_geometry(inner)
     return inner
 
 
 def dtm_layout(inner: bytes) -> tuple[dict[str, dict[str, int]], tuple[int, ...]]:
+    validate_map_geometry(inner)
     sizes = struct.unpack_from("<6I", inner, 0x1C)
     pos = DTM_SECTION_BASE
     sections: dict[str, dict[str, int]] = {}
@@ -186,6 +273,19 @@ def save_metadata(payload: bytes) -> dict[str, Any]:
     result["map_header_offset"] = pos
     result["metadata_prefix_size"] = pos
     return result
+
+
+def rename_save_slot(payload: bytes, name: str) -> bytes:
+    """Replace only the first metadata string; map title/date/game state stay intact."""
+    save_metadata(payload)
+    if not name or '\0' in name:
+        raise SavError('Название сохранения не должно быть пустым или содержать нулевой символ.')
+    try:
+        encoded = name.encode('cp1251')
+    except UnicodeEncodeError as exc:
+        raise SavError('Название сохранения содержит символы, не поддерживаемые игрой (Windows-1251). Переименуйте выходной файл.') from exc
+    end = payload.index(b'\0')
+    return encoded + payload[end:]
 
 
 def hamming(a: bytes, b: bytes) -> int:
@@ -321,14 +421,17 @@ def relate(payload: bytes, inner: bytes, outer: dict[str, Any]) -> dict[str, Any
     lantern_count = sections["lanterns"]["count"]
     event_count = sections["events"]["count"]
 
-    grid_start = map_offset + MAP_PREFIX_SIZE + RUNTIME_ARMY_SIZE
-    inferred_grid_size = 38 * cell_count + 24 * width + 9054
+    grid_profile = compiled_grid_profile(width, height)
+    grid_start = map_offset + MAP_PREFIX_SIZE + grid_profile['initial_state_size']
+    inferred_grid_size = grid_profile['grid_size']
     expected_building_start = grid_start + inferred_grid_size
     building_start, signature_offset = find_building_start(
         payload, building_count, army_count, lantern_count, event_count,
         expected_start=expected_building_start,
     )
     observed_grid_size = building_start - grid_start
+    if (width, height) == (50, 50) and observed_grid_size != inferred_grid_size:
+        raise SavError('50x50 save does not match the verified grid boundary')
 
     map_building_start = sections["buildings"]["offset"]
     map_lantern_start = sections["lanterns"]["offset"]
@@ -414,19 +517,19 @@ def relate(payload: bytes, inner: bytes, outer: dict[str, Any]) -> dict[str, Any
             "first_303_byte_differences": header_differences_303,
             "initial_opaque_state": {
                 "offset": map_offset + MAP_PREFIX_SIZE,
-                "size": RUNTIME_ARMY_SIZE,
+                "size": grid_profile['initial_state_size'],
                 "end": grid_start,
             },
             "compiled_grid": {
                 "offset": grid_start,
                 "end": building_start,
                 "observed_size": observed_grid_size,
-                "inferred_formula": "38*width*height + 24*width + 9054",
+                "inferred_formula": grid_profile['formula'],
                 "inferred_size": inferred_grid_size,
                 "formula_matches": observed_grid_size == inferred_grid_size,
-                "inferred_u16_cell_layers": 19,
-                "cell_layers_size": 38 * cell_count,
-                "row_and_fixed_tail_size": 24 * width + 9054,
+                "inferred_u16_cell_layers": grid_profile['layers'],
+                "cell_layers_size": grid_profile['cell_layers_size'],
+                "row_and_fixed_tail_size": grid_profile['tail_size'],
             },
             "count_signature_offset": signature_offset,
             "buildings": {
@@ -482,23 +585,23 @@ def output_json(value: Any, pretty: bool, path: Path | None) -> None:
 
 
 def command_info(args: argparse.Namespace) -> None:
-    raw = args.save.read_bytes()
+    raw = read_bounded(args.save)
     payload, info = unpack_sav_bytes(raw)
     info["metadata"] = save_metadata(payload)
     output_json(info, args.pretty, args.output)
 
 
 def command_unpack(args: argparse.Namespace) -> None:
-    payload, _ = unpack_sav_bytes(args.save.read_bytes())
+    payload, _ = unpack_sav_bytes(read_bounded(args.save))
     args.payload.write_bytes(payload)
     print(f"wrote {len(payload)} bytes to {args.payload}")
 
 
 def command_pack(args: argparse.Namespace) -> None:
-    payload = args.payload.read_bytes()
+    payload = read_bounded(args.payload, MAX_SAV_BYTES)
     tag = SAV_DEFAULT_TAG
     if args.template:
-        raw = args.template.read_bytes()
+        raw = read_bounded(args.template)
         if len(raw) < 8 or raw[:4] != SAV_MAGIC:
             raise SavError("template is not an AEpf save")
         tag = raw[4:8]
@@ -508,7 +611,7 @@ def command_pack(args: argparse.Namespace) -> None:
 
 
 def command_roundtrip(args: argparse.Namespace) -> None:
-    original = args.input.read_bytes()
+    original = read_bounded(args.input)
     payload, info = unpack_sav_bytes(original)
     rebuilt = pack_sav_bytes(payload, original[4:8])
     args.output.write_bytes(rebuilt)
@@ -523,7 +626,7 @@ def command_roundtrip(args: argparse.Namespace) -> None:
 
 
 def command_relate(args: argparse.Namespace) -> None:
-    payload, outer = unpack_sav_bytes(args.save.read_bytes())
+    payload, outer = unpack_sav_bytes(read_bounded(args.save))
     inner = read_dtm(args.map)
     output_json(relate(payload, inner, outer), args.pretty, args.output)
 

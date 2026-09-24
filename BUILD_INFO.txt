@@ -1,30 +1,6 @@
-DTm2SAV - live game-data + building/decor overlap support v6.2
-Date: 2026-09-20
-
-Startup game-data loading
-- Required beside the application: Rus_Units.ini, Rus_Artefacts.ini, Rus_Spells.ini, _Global.ini
-- Required fixed subpath: Graphics\Objects\Objects.ugs
-- Missing/unreadable required data is fatal before the main GUI opens
-- Active runtime calculations use the live game files; army_catalog.json is the tested reference profile
-- Changed gameplay parameters trigger a non-blocking native-testing warning and remain saveable
-
-Core support
-- MapLDV V.4 event/terrain/decor/lantern sync
-- Army add/edit/delete/insert/reorder, max 12 units, artifacts/spells, tactical strength/upkeep, reference remap
-- Building add/edit/delete/insert/reorder; garrisons, barracks, markets and shrine/church spells
-- Building placement/removal rebuilds hidden C/A/B property layers and compiled navigation
-- Native navigation-footprint extensions are learned from source SAV by building picture/type/size signature
-- Strict runtime/reference/grid verifiers
-
-Validation
-- Automated tests: 115/115 PASS (post-review; native v6.2 snapshot remains 108/108)
-- Python compile: PASS
-- GUI import: PASS
-- New.DTm/New.sav no-op SHA-256 unchanged: 64260ac4aeaef978031b055dfed315e1c97f0134226149f42cfae6c4f9a2e1b8
-- Objects no-op unchanged: de30db63c56e561d4407066ac0e225ed77516fdbc735eab32eac5d8f92adebd7
-- Objects2 no-op unchanged: ff918ec879f849cf08b4b87cf797fd070601cbc2b896f5ce5c95d7ce3d54cf55
-- Objects -> Objects2 output unchanged: 2fad01a4b9b4f67d94b24cb9700d8bc9a945c8b07b69790268cfe41777b6b7e6
-- Multi-artifact regression output unchanged: be9c73c458762e8243c54acb0154768617f5d34997370865cd538ad3a51724cd
-- Shoreline building-over-trees control: compiled-grid 0 diff vs native Другой берег7.sav; all building attached states 0 diff
-
-Original supplied game files load successfully: 102 units, 167 artifacts, 35 spell sections, CostRecruitDiv=2, 285 Objects.ugs decoration records.
+DTm2SAV v6.5 - army cell-index lifecycle fix and save naming
+Date: 2026-09-24
+Validation: 181 tests passed; native input fixtures, GUI and CLI controls PASS.
+Python: 3.13; game load/battle not exercised.
+See CHANGES_v6.5_RU.md for current instructions and limitations.
+Historical validation files describe earlier versions.

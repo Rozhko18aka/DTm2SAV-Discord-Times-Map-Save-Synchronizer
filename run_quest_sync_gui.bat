@@ -27,4 +27,4 @@ exit /b 2
 
 rem To build a one-file EXE from this folder:
 rem python -m pip install pyinstaller
-rem python -m PyInstaller --clean --onefile --windowed --name DiscordTimes_QuestSync --add-data "army_catalog.json;." --add-data "army_native_profiles.json;." dtm_to_sav_gui.py
+rem python -m PyInstaller --clean --onefile --windowed --name DiscordTimes_QuestSync --icon "assets\Icon.ico" --add-data "assets;assets" --add-data "army_catalog.json;." --add-data "army_native_profiles.json;." dtm_to_sav_gui.py

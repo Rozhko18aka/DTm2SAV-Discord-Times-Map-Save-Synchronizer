@@ -31,7 +31,7 @@ def _decode_unit(u: bytes) -> dict:
 
 
 def scan(save_path: Path, dtm_path: Path) -> dict:
-    raw = save_path.read_bytes()
+    raw = sav_tool.read_bounded(save_path)
     payload, outer = sav_tool.unpack_sav_bytes(raw)
     inner = sav_tool.read_dtm(dtm_path)
     relation = sav_tool.relate(payload, inner, outer)

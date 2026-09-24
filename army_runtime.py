@@ -788,7 +788,7 @@ def _unit_model_code(uid:int):
 
 
 def _template_fields(template:bytes|None, uid:int, level:int, catalog:dict|None=None):
-    if template and len(template)==UNIT_STRIDE:
+    if template and len(template)==UNIT_STRIDE and uid not in _compat_ids(catalog, 'changed_units'):
         b=template[0x11D:0x15D]
         return struct.unpack_from('<II',b,56)
     p=_profile_for(uid,level,catalog)
@@ -873,7 +873,7 @@ def make_unit_record(uid:int, level:int, is_main:bool, named_id:int, spell_id:in
     buf[0x1A5]=1; struct.pack_into('<I',buf,0x1A6,1)
 
     base_strength=prof.get('strength')
-    if base_strength is None and template:
+    if base_strength is None and template and uid not in _compat_ids(catalog, 'changed_units'):
         base_strength=struct.unpack_from('<I',template,0x1AA)[0]
     if base_strength is None:
         if enforce_strict:
@@ -886,7 +886,7 @@ def make_unit_record(uid:int, level:int, is_main:bool, named_id:int, spell_id:in
     if mod_strength is None:
         if not item_ids and not spell_id:
             mod_strength=base_strength
-        elif template and tuple(struct.unpack_from('<I',template,o)[0] for o in (0xCD,0xD1,0xD5))==tuple((item_ids+[0,0,0])[:3]) and struct.unpack_from('<I',template,0x24)[0]==((spell_id-1) if spell_id else 0xFFFFFFFF):
+        elif template and not profile_untested and tuple(struct.unpack_from('<I',template,o)[0] for o in (0xCD,0xD1,0xD5))==tuple((item_ids+[0,0,0])[:3]) and struct.unpack_from('<I',template,0x24)[0]==((spell_id-1) if spell_id else 0xFFFFFFFF):
             mod_strength=struct.unpack_from('<I',template,0x1AE)[0]
         elif enforce_strict:
             raise ValueError(
@@ -1197,6 +1197,10 @@ def verify_runtime_army_block(block:bytes, catalog:dict|None=None, *, expected_c
         exp=[(u,l) for u,l,*_ in expected_comp]
         if comp!=exp:
             issues.append(f'composition={comp!r} expected={exp!r}')
+        if rebuilt and len(records) == len(expected_comp):
+            for i, (u, expected) in enumerate(zip(records, expected_comp)):
+                if len(expected) >= 3 and u[0x19D] != (0 if expected[2] else 1):
+                    issues.append(f'unit[{i}] leader/troop role mismatch')
     if rebuilt:
         used_end=UNIT_BASE_OFF+cnt*UNIT_STRIDE
         if any(block[used_end:UNIT_AREA_END]):
@@ -1231,7 +1235,7 @@ def assert_runtime_army_block(block:bytes, catalog:dict|None=None, *, expected_c
     return report
 
 
-def verify_synced_tail(tail:bytes, new_recs:list[ArmyRecord], catalog:dict, *, rebuilt_indices=(), formation_relaxed_indices=()):
+def verify_synced_tail(tail:bytes, new_recs:list[ArmyRecord], catalog:dict, *, rebuilt_indices=(), formation_relaxed_indices=(), preserved_compositions=None):
     """Strict post-build verifier for hero + NPC slots + residual dynamic tail."""
     need=(len(new_recs)+1)*RUNTIME_ARMY_SIZE
     issues=[]
@@ -1242,8 +1246,9 @@ def verify_synced_tail(tail:bytes, new_recs:list[ArmyRecord], catalog:dict, *, r
     reports=[]
     for i,rec in enumerate(new_recs):
         a=(i+1)*RUNTIME_ARMY_SIZE; b=a+RUNTIME_ARMY_SIZE
+        expected = rec.expanded() if i in rebuilt else (preserved_compositions or {}).get(i)
         r=verify_runtime_army_block(
-            tail[a:b],catalog,expected_comp=rec.expanded(),rebuilt=(i in rebuilt),verify_formation=(i not in formation_relaxed)
+            tail[a:b],catalog,expected_comp=expected,rebuilt=(i in rebuilt),verify_formation=(i not in formation_relaxed)
         )
         reports.append(r)
         if not r['ok']:
@@ -1338,14 +1343,27 @@ def _prev_cost(rec:ArmyRecord,catalog:dict):
     return max(0,min(65535,total))
 
 
-def patch_direct_fields(block:bytearray, old:ArmyRecord|None, new:ArmyRecord, preserve_progress=True, catalog:dict|None=None):
+def merged_position(current:tuple[int,int], old:ArmyRecord|None, new:ArmyRecord, preserve_progress:bool=True):
+    """Merge a position as one value, shared by runtime and occupancy writes."""
+    if old is None or not preserve_progress or current == (old.x, old.y):
+        return new.x, new.y
+    return current
+
+
+def patch_direct_fields(block:bytearray, old:ArmyRecord|None, new:ArmyRecord, preserve_progress=True, catalog:dict|None=None, skipped:list|None=None):
+    def note(off, cur, oldv, newv):
+        if skipped is not None and old is not None and preserve_progress and oldv != newv and cur not in (oldv, newv):
+            skipped.append(f'поле +0x{off:X}: в карте {oldv}, в SAV {cur}, запрошено {newv}')
     def patch_u8(off, oldv, newv):
+        note(off, block[off], oldv, newv)
         if old is None or not preserve_progress or block[off]==oldv: block[off]=newv & 0xff
     def patch_i32(off, oldv, newv):
         cur=struct.unpack_from('<i',block,off)[0]
+        note(off, cur, oldv, newv)
         if old is None or not preserve_progress or cur==oldv: struct.pack_into('<i',block,off,newv)
     def patch_u32(off, oldv, newv):
         cur=struct.unpack_from('<I',block,off)[0]
+        note(off, cur, oldv, newv)
         if old is None or not preserve_progress or cur==oldv: struct.pack_into('<I',block,off,newv)
     patch_u8(ACTIVE_OFF, (1-old.activity) if old else 0, 1-new.activity)
     patch_u8(GROUP_OFF, old.group_type if old else 0, new.group_type)
@@ -1388,9 +1406,13 @@ def patch_direct_fields(block:bytearray, old:ArmyRecord|None, new:ArmyRecord, pr
         # to zero; copying it from an arbitrary representative would leak state.
         struct.pack_into('<I',block,0x1EE4,0)
     # Home/current position are separately progress-sensitive.
-    oldxy=(old.x,old.y) if old else (0,0)
-    for off,ov,nv in ((HOME_X_OFF,oldxy[0],new.x),(HOME_Y_OFF,oldxy[1],new.y),(CURRENT_X_OFF,oldxy[0],new.x),(CURRENT_Y_OFF,oldxy[1],new.y)):
-        patch_u32(off,ov,nv)
+    for xoff,yoff in ((HOME_X_OFF,HOME_Y_OFF),(CURRENT_X_OFF,CURRENT_Y_OFF)):
+        current=tuple(struct.unpack_from('<I',block,off)[0] for off in (xoff,yoff))
+        if old is not None:
+            note(xoff, current, (old.x, old.y), (new.x, new.y))
+        desired=merged_position(current,old,new,preserve_progress)
+        for off,value in zip((xoff,yoff),desired):
+            struct.pack_into('<I',block,off,value)
 
 
 def _payment_guess(uid:int, level:int, catalog:dict, learned:dict|None=None, *, strict:bool=False)->int:
@@ -1434,7 +1456,18 @@ def rebuild_composition(block:bytearray, old_rec:ArmyRecord|None, new_rec:ArmyRe
         if chosen is not None:
             used.add(chosen); template=old_records[chosen]
             if not semantic_army_effect_changed:
-                records.append(template)
+                # Preserve gameplay bytes but update a changed leader/troop role.
+                role_record=bytearray(template)
+                if role_record[0x19D] != (0 if is_main else 1):
+                    struct.pack_into('<I',role_record,0x14,new_rec.named_unit_id if is_main else 0)
+                    struct.pack_into('<I',role_record,0x18,_unit_model_code(uid) if is_main else 0)
+                    struct.pack_into('<I',role_record,0x1C,uid if is_main else 3)
+                    role_record[0x19D]=0 if is_main else 1
+                old_equipment=tuple(struct.unpack_from('<I',template,o)[0] for o in (0xCD,0xD1,0xD5))
+                desired_equipment=tuple((item_dist[idx]+[0,0,0])[:3])
+                if old_equipment != desired_equipment:
+                    raise ValueError('Перераспределение экипировки существующего бойца остановлено, чтобы сохранить его прогресс.')
+                records.append(bytes(role_record))
                 continue
         else:
             template=source_templates.get((uid,lvl))
@@ -1493,6 +1526,7 @@ def sync_army_tail(source_tail:bytes, old_recs:list[ArmyRecord], new_recs:list[A
     out_blocks=[]
     rebuilt_indices=set()
     formation_relaxed_indices=set()
+    preserved_compositions={}
     for ti,newr in enumerate(new_recs):
         si=mapping[ti] if ti<len(mapping) else None
         if si is not None:
@@ -1521,6 +1555,8 @@ def sync_army_tail(source_tail:bytes, old_recs:list[ArmyRecord], new_recs:list[A
                 rebuilt_indices.add(ti)
                 if preserve_formation:
                     formation_relaxed_indices.add(ti)
+            else:
+                preserved_compositions[ti]=curcomp
             patch_direct_fields(block,oldr,newr,True,catalog)
         else:
             # New army: would-be slot header from source residual; post-unit defaults from a similar native army.
@@ -1558,10 +1594,42 @@ def sync_army_tail(source_tail:bytes, old_recs:list[ArmyRecord], new_recs:list[A
     verified=verify_synced_tail(
         result,new_recs,catalog,rebuilt_indices=rebuilt_indices,
         formation_relaxed_indices=formation_relaxed_indices,
+        preserved_compositions=preserved_compositions,
     )
     if not verified['ok']:
         raise ValueError('Построенный runtime-хвост не прошёл строгую проверку: ' + '; '.join(verified['issues']))
     return result
+
+
+def sync_army_cell_indices(source_tail: bytes, target_tail: bytes,
+                           mapping: list[int | None], old_count: int,
+                           stride: int) -> bytes:
+    """Maintain the two global 256-entry cell-index arrays before the hero.
+
+    Entry 0 is reserved, entry 1 belongs to the hero, NPC i uses entry i+1.
+    Native activation (00496B86/00496B93) writes x + stride*y to both;
+    defeat (00496834) uses these entries to remove the cell's army marker.
+    They are not per-slot headers. Preserve both values for moving armies
+    unless the conversion explicitly changes their position/activation.
+    """
+    if max(old_count, len(mapping)) > 254:
+        raise ValueError('В таблицах клеток помещается не более 254 армий.')
+    out = bytearray(target_tail)
+    for base in (0, 0x400):
+        for i in range(max(old_count, len(mapping))):
+            struct.pack_into('<I', out, base + 4*(i+2), 0)
+        for ti, si in enumerate(mapping):
+            target = (ti+1)*RUNTIME_ARMY_SIZE
+            active = out[target+ACTIVE_OFF]
+            xy = struct.unpack_from('<II', out, target+CURRENT_X_OFF)
+            value = xy[0] + stride*xy[1] if active else 0
+            if si is not None:
+                source = (si+1)*RUNTIME_ARMY_SIZE
+                old_xy = struct.unpack_from('<II', source_tail, source+CURRENT_X_OFF)
+                if xy == old_xy and active == source_tail[source+ACTIVE_OFF]:
+                    value = struct.unpack_from('<I', source_tail, base+4*(si+2))[0]
+            struct.pack_into('<I', out, base+4*(ti+2), value)
+    return bytes(out)
 
 
 def remap_id(value:int, deleted_old_ids:set[int], old_to_new:dict[int,int], *, deleted_value=0):
