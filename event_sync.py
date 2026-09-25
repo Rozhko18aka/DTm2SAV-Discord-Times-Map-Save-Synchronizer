@@ -78,13 +78,16 @@ def remap_record(raw, offsets, mapping, *, bindings=False):
     return bytes(out)
 
 
-def rebase_map_refs(doc, mapping):
+def rebase_map_refs(doc, mapping, *, preserved_event_indices=()):
     try:
         doc.header[:] = remap_record(doc.header, SETTING_REFS, mapping)
     except ValueError as exc:
         raise ValueError(f'Условие победы/поражения: {exc}') from exc
     events=[]
     for i,raw in enumerate(doc.records('events'),1):
+        if i-1 in preserved_event_indices:
+            events.append(raw)
+            continue
         try:
             events.append(remap_record(raw,EVENT_REFS,mapping))
         except ValueError as exc:
@@ -147,7 +150,7 @@ def align_events(old, new):
     return result
 
 
-def normalize_events(old, requested):
+def normalize_events(old, requested, *, progressed_indices=()):
     """Rebase editor event IDs into original slots; removals commit last."""
     mapping = align_events(old, requested)
     doc = requested.clone()
@@ -166,7 +169,12 @@ def normalize_events(old, requested):
             texts[source*3:source*3+3] = requested.texts['events'][target*3:target*3+3]
     # Rebase only records actually present in the editor; restored slots already
     # use original IDs and must not be interpreted in the editor namespace.
-    rebase_map_refs(doc, target_to_stable)
+    # Editor changes to progressed events are discarded by the caller. Their
+    # references must not be validated in the editor namespace first: even a
+    # dangling editor reference is irrelevant to the preserved SAV record.
+    preserved = {target for target, source in enumerate(mapping)
+                 if source is not None and source in progressed_indices}
+    rebase_map_refs(doc, target_to_stable, preserved_event_indices=preserved)
     rebased = doc.records('events')
     for target, stable in target_to_stable.items():
         records[stable-1] = rebased[target-1]

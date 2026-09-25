@@ -52,6 +52,81 @@ class SavError(ValueError):
     pass
 
 
+class DtmReadError(SavError):
+    """Readable file-specific error; keep the parser detail for diagnostics."""
+    def __init__(self, path, reason, detail):
+        self.path = Path(path)
+        self.reason = reason
+        self.technical_detail = detail
+        super().__init__(
+            f'Не удалось прочитать карту DTm.\nФайл: {self.path}\n\n'
+            f'Причина: {reason}\n\n'
+            'Проверьте, что выбрана нужная карта. Попробуйте открыть её в редакторе '
+            'игры и сохранить под новым именем либо выберите резервную копию. '
+            'Исходный файл не изменён.')
+
+
+def _dtm_read_reason(detail):
+    if 'not an AIpf' in detail:
+        return ('В начале файла нет признаков поддерживаемой карты DTm. '
+                'Возможно, выбран другой тип файла или начало файла повреждено.')
+    if 'bad AIpf/BZip2' in detail:
+        return ('Оболочка карты распознана, но начало сжатых данных отсутствует '
+                'или имеет неподдерживаемый формат.')
+    if 'bad or truncated MapLDV' in detail:
+        return ('Не найден полный заголовок карты — её начальная служебная часть. '
+                'Данные могли обрезаться или относятся к другому формату.')
+    if 'unsupported map dimensions:' in detail:
+        size = detail.rsplit(':',1)[-1].strip()
+        return (f'В файле указан размер карты {size}. Программа допускает размеры '
+                f'от 1 до {MAX_MAP_DIMENSION} клеток по каждой стороне. '
+                'Это может быть неверный размер или неподдерживаемая карта.')
+    if 'map declared size is invalid' in detail:
+        return ('В файле указан неверный размер распакованной карты либо размер '
+                'выше ограничения программы. Это само по себе не доказывает повреждение.')
+    if 'input exceeds' in detail:
+        return ('Файл больше допустимого размера: 64 МБ. Это ограничение программы, '
+                'а не признак повреждения карты.')
+    if 'decompressed data exceeds' in detail or 'unpacked-size field does not match' in detail:
+        return ('Размер данных после распаковки не соответствует размеру, указанному '
+                'в файле. Данные карты и её служебная информация расходятся.')
+    if 'truncated BZip2' in detail:
+        return ('Сжатые данные карты обрываются раньше конца. '
+                'Возможно, файл был скопирован или сохранён не полностью.')
+    if 'trailing data or concatenated' in detail:
+        return ('После конца сжатой карты найдены лишние данные. '
+                'Программа не умеет читать такую структуру файла.')
+    if 'invalid BZip2' in detail:
+        return ('Сжатые данные карты не удаётся распаковать: их целостность нарушена. '
+                'Возможно, файл повреждён при сохранении или копировании.')
+    if detail.startswith('map section '):
+        names = {'surface':'ландшафта','decorations':'декораций','buildings':'строений',
+                 'armies':'армий','lanterns':'фонарей','events':'событий'}
+        section = names.get(detail.split()[2], 'объектов')
+        if 'extends past EOF' in detail:
+            return (f'В файле не хватает данных раздела {section}: по служебной '
+                    'информации он должен быть длиннее. Возможно, файл обрезан.')
+        return (f'Размер раздела {section} не соответствует размеру целых записей. '
+                'Часть записи потеряна либо формат карты не поддерживается.')
+    if 'map texts overlap sections' in detail:
+        return ('В файле указано, что тексты начинаются внутри данных объектов. '
+                'Разделы карты пересекаются; их расположение записано неверно.')
+    if 'map texts outside file' in detail:
+        return ('В файле указано начало текстов за его концом. '
+                'Тексты отсутствуют либо их расположение записано неверно.')
+    if 'unterminated string' in detail:
+        return ('Не удалось прочитать все названия и описания: один из текстов '
+                'обрывается или отсутствует. Возможно, файл сохранён не полностью.')
+    if detail == 'map surface incomplete pair':
+        return ('В разделе ландшафта последняя запись обрывается: '
+                'у неё не хватает данных о количестве клеток.')
+    if detail.startswith('map surface cell count:'):
+        actual, expected = detail.split(':',1)[1].strip().split('/')
+        return (f'Число клеток ландшафта — {actual}, а по размеру карты должно быть {expected}. '
+                'Данные ландшафта не согласуются с размером карты.')
+    return 'Структура карты не соответствует поддерживаемому формату DTm.'
+
+
 def read_bounded(path: Path, limit: int = MAX_FILE_BYTES) -> bytes:
     with Path(path).open('rb') as stream:
         # Avoid allocating the entire safety budget for a small input file.
@@ -224,6 +299,28 @@ def pack_sav_bytes(payload: bytes, tag: bytes = SAV_DEFAULT_TAG) -> bytes:
 
 
 def read_dtm(path: Path) -> bytes:
+    try:
+        inner = _read_dtm(path)
+        sections, _ = dtm_layout(inner)
+        surface = sections['surface']
+        if surface['size'] % 2:
+            raise SavError('map surface incomplete pair')
+        actual_cells = sum(value+1 for value in inner[surface['offset']+1:surface['end']:2])
+        width, height = struct.unpack_from('<II',inner,12)
+        if actual_cells != width*height:
+            raise SavError(f'map surface cell count: {actual_cells}/{width*height}')
+        text_start = u32(inner, 24)
+        if text_start < sections['events']['end']:
+            raise SavError('map texts overlap sections')
+        if text_start >= len(inner):
+            raise SavError('map texts outside file')
+        parse_texts_from_map(inner, sections)
+        return inner
+    except SavError as exc:
+        raise DtmReadError(path, _dtm_read_reason(str(exc)), str(exc)) from exc
+
+
+def _read_dtm(path: Path) -> bytes:
     raw = read_bounded(path, MAX_DTM_BYTES)
     if raw.startswith(DTM_MAGIC):
         if len(raw) < 16 or raw[12:16] != b"BZh9":
@@ -311,7 +408,7 @@ def find_building_start(
         positions.append(pos)
         pos += 1
     if not positions:
-        raise SavError("building/army/lantern/event count signature not found")
+        raise SavError('Количество строений, армий, фонарей или событий в SAV не совпадает с исходной DTm. Для повторного переноса оставьте рядом с SAV его .sync.json, созданный версией 6.6 или новее, либо выберите карту, соответствующую фактически сохранённым изменениям.')
     # In observed V.4 saves the signature directly precedes building[0].  The
     # count tuple can be very weak (for example 0/15/0/0) and may occur inside
     # zero-heavy runtime blocks.  When the compiled-grid formula is available,

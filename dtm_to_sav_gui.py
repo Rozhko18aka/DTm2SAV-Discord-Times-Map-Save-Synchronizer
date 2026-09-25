@@ -564,6 +564,29 @@ class QuestSyncApp(tk.Tk):
 
     def _fill_building_table(self, plan: sync.SyncPlan) -> None:
         self.building_tree.delete(*self.building_tree.get_children())
+        for target,source in enumerate(plan.building_mapping):
+            if source is None:
+                continue
+            before=sync._building_record(plan.original_inner,plan.original_sections['buildings'],source)
+            after=sync._building_record(plan.modified_inner,plan.modified_sections['buildings'],target)
+            old_text=plan.original_strings[4+source*3:7+source*3]
+            new_text=plan.modified_strings[4+target*3:7+target*3]
+            binary=before!=after; text=old_text!=new_text
+            if not (binary or text or source!=target):
+                continue
+            rec=sync.building_runtime.parse_building_record(after)
+            old_rec=sync.building_runtime.parse_building_record(before)
+            action='изменить + текст' if binary and text else 'изменить' if binary else 'изменить текст' if text else 'перенумеровать'
+            coords=self._coords_text(*rec.runtime_coords)
+            if rec.runtime_coords!=old_rec.runtime_coords:
+                coords=self._coords_text(*old_rec.runtime_coords)+' → '+coords
+            self.building_tree.insert('', 'end', values=(target+1,action,rec.building_type,coords,
+                f'{rec.picture_number}/{rec.picture_variant}','сохранить прогресс'))
+        for index in plan.building_deleted_indices:
+            raw=sync._building_record(plan.original_inner,plan.original_sections['buildings'],index)
+            rec=sync.building_runtime.parse_building_record(raw)
+            self.building_tree.insert('', 'end', values=(index+1,'удалить',rec.building_type,
+                self._coords_text(*rec.runtime_coords),f'{rec.picture_number}/{rec.picture_variant}','удаляется'))
         for item in plan.building_additions:
             self.building_tree.insert(
                 "",
@@ -732,10 +755,11 @@ class QuestSyncApp(tk.Tk):
         self.notebook.tab(6, text=f'Заблокированные изменения ({len(prepared.blocked)})')
         deleted = set(prepared.report['deleted_event_ids'])
         requested = set(prepared.report['requested_deleted_event_ids'])
+        skipped=set(prepared.report.get('skipped_progressed_event_ids',()))
         for event_id in requested:
             row = f'event-{event_id}'
             if self.tree.exists(row):
-                self.tree.set(row, 'action', 'удалить' if event_id in deleted else 'удаление заблокировано')
+                self.tree.set(row, 'action', 'удалить' if event_id in deleted else 'сохранить прогресс' if event_id in skipped else 'удаление заблокировано')
                 self.tree.item(row, tags=('selected' if event_id in deleted else 'progressed',))
         self.summary_var.set(
             f'Допустимых групп изменений: {len(prepared.applied)}. '
@@ -747,6 +771,8 @@ class QuestSyncApp(tk.Tk):
             '2. Сохранить без заблокированных изменений…' if prepared.blocked else '2. Создать новый SAV'))
         for item in prepared.blocked:
             self._log(f"ПРОПУСК: {item['data']}. Причина: {item['reason']}")
+        for message in prepared.report.get('baseline_warnings',()):
+            self._log(message)
         if prepared.blocked:
             self.notebook.select(6)
 
@@ -839,7 +865,7 @@ class QuestSyncApp(tk.Tk):
                 return
             overwrite = False
             report_path = output.with_suffix(output.suffix+'.sync.json')
-            if output.exists() or (self.write_report_var.get() and report_path.exists()):
+            if output.exists() or report_path.exists():
                 overwrite = messagebox.askyesno('Файл существует',
                     f'Перезаписать существующий результат и отчёт?\n{output}',parent=self)
                 if not overwrite:
@@ -848,9 +874,16 @@ class QuestSyncApp(tk.Tk):
                 write_report=self.write_report_var.get(),allow_overwrite=overwrite)
             self._log(f'Готово: {output}\nSHA-256: {report["output_sha256"]}')
             self._log(f'Название сохранения в игре: {report["save_name"]}')
+            if prepared.report.get('baseline_from_json'):
+                self._log('Исходное состояние карты восстановлено из JSON этого SAV.')
+            elif prepared.report.get('baseline_from_cache'):
+                self._log('Исходное состояние карты восстановлено из внутреннего кэша.')
             if report.get('report_status') == 'failed':
                 messagebox.showwarning('SAV создан, отчёт не записан',
-                    f'{output}\n{report["report_error"]}',parent=self)
+                    f'{output}\n{report["report_error"]}\nДанные повторного переноса не записаны.',parent=self)
+            elif report.get('baseline_cache_status') == 'failed' and not self.write_report_var.get():
+                messagebox.showwarning('SAV создан, кэш не записан',
+                    f'{output}\nДанные повторного переноса не сохранены: {report["baseline_cache_error"]}',parent=self)
             else:
                 messagebox.showinfo('Готово',
                     f'Новое сохранение создано.\nПропущено групп изменений: {len(prepared.blocked)}.\n'

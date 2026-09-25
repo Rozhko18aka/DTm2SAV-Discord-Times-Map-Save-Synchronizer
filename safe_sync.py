@@ -2,12 +2,16 @@
 from dataclasses import dataclass, field
 from pathlib import Path
 import struct
+import base64
+import bz2
+import json
 
 import army_runtime as ar
 import building_runtime as br
 import dtm_sav_quest_sync as qs
 import event_sync as es
 import sav_tool as st
+import conversion_state
 
 
 @dataclass
@@ -97,6 +101,15 @@ def collect_changes(old, new):
     grouped = set()
     if structural:
         grouped = {'buildings','armies','lanterns','events'}
+        am, ad = ar.align_armies(old.records('armies'),new.records('armies'))
+        bm, bd = br.align_buildings(old.records('buildings'),new.records('buildings'))
+        def append_only(mapping, deleted, count):
+            return not deleted and mapping[:count] == list(range(count)) and all(i is None for i in mapping[count:])
+        if (append_only(am,ad,len(old.records('armies'))) and
+                append_only(bm,bd,len(old.records('buildings')))):
+            # Existing IDs remain stable: independent event edits must not
+            # prevent appending armies/buildings when an event has progressed.
+            grouped.remove('events')
         changes.append(Change('structure', 'Структура объектов и связанные события',
             'Добавление/удаление/перенумерация армий или строений и их зависимые ссылки (единая группа).',
             sections={k:new.sections[k] for k in grouped},
@@ -168,14 +181,77 @@ def collect_changes(old, new):
     return changes
 
 
+def read_report(data):
+    try:
+        report=json.loads(data.decode('utf-8'))
+        if not isinstance(report,dict):
+            raise ValueError('Корень JSON должен быть объектом.')
+        if 'conversion_baseline' in report:
+            baseline=report['conversion_baseline']
+            if not isinstance(baseline,dict):
+                raise ValueError('conversion_baseline должен быть объектом.')
+            for key in ('format','save_sha256','map_sha256','data'):
+                if not isinstance(baseline.get(key),str):
+                    raise ValueError(f'В conversion_baseline поле {key} отсутствует или не является строкой.')
+        return report
+    except (ValueError,UnicodeError,RecursionError) as exc:
+        raise qs.QuestSyncError(f'Некорректный JSON-отчёт: {exc}') from exc
+
+
 def prepare_paths(source, original, modified, objects_ugs=None, *, delete_event_ids=()):
     source, original, modified = map(Path,(source,original,modified))
     raw = st.read_bounded(source)
     old_bytes, requested_bytes = st.read_dtm(original),st.read_dtm(modified)
+    baseline_path = source.with_suffix(source.suffix+'.sync.json')
+    baseline_used = False
+    cache_used = False
+    baseline_warnings=[]
+    def validate_baseline(inner):
+        es.MapData.read(inner)
+        saved_payload,info=st.unpack_sav_bytes(raw)
+        relation=st.relate(saved_payload,inner,info)
+        if not relation['relationship']['map_prefix_matches']:
+            raise ValueError('Заголовок сохранённого состояния карты не соответствует SAV.')
+    if baseline_path.is_file():
+        try:
+            saved = read_report(st.read_bounded(baseline_path,32*1024*1024))
+            baseline = saved.get('conversion_baseline')
+            if baseline:
+                if baseline.get('save_sha256') != st.sha256(raw):
+                    raise ValueError('SAV изменился после создания JSON. Нужна исходная DTm, соответствующая этому SAV; устаревший JSON следует убрать из папки.')
+                if baseline.get('format') != 'dtm-bz2-base64-v1':
+                    raise ValueError('Неизвестный формат данных повторного переноса.')
+                decoded = st.decompress_bounded(base64.b64decode(baseline['data'],validate=True),st.MAX_DTM_BYTES,'conversion baseline')
+                if st.sha256(decoded) != baseline['map_sha256']:
+                    raise ValueError('Повреждены данные повторного переноса в JSON.')
+                validate_baseline(decoded)
+                old_bytes = decoded
+                baseline_used = True
+        except (OSError,ValueError,KeyError,TypeError,struct.error) as exc:
+            baseline_warnings.append(f'JSON пропущен: {exc}')
+    if not baseline_used:
+        try:
+            cached=conversion_state.read(st.sha256(raw))
+            if cached is not None:
+                validate_baseline(cached)
+                old_bytes=cached
+                cache_used=True
+        except (OSError,ValueError,KeyError,TypeError,struct.error) as exc:
+            baseline_warnings.append(f'Кэш пропущен: {exc}')
     old, requested = es.MapData.read(old_bytes),es.MapData.read(requested_bytes)
     if old.header[12:20] != requested.header[12:20]:
         raise qs.QuestSyncError('Размер карты изменён. Частичный перенос между разными размерами не поддерживается.')
-    normalized, removed, target_to_stable = es.normalize_events(old,requested)
+    expected_errors = (qs.QuestSyncError,st.SavError,ValueError,struct.error)
+    def baseline_failure(exc):
+        if baseline_warnings:
+            raise qs.QuestSyncError('Данные JSON/кэша не удалось использовать, а выбранная исходная DTm не соответствует SAV. Выберите карту фактически сохранённого состояния или восстановите корректный JSON. '+str(exc)) from exc
+        raise exc
+    try:
+        source_plan = qs.analyze_data(source,original,original,raw,old_bytes,old_bytes,objects_ugs)
+    except expected_errors as exc:
+        baseline_failure(exc)
+    normalized, removed, target_to_stable = es.normalize_events(
+        old,requested,progressed_indices={item.index for item in source_plan.progressed})
     for event_id in delete_event_ids:
         if event_id not in target_to_stable:
             raise qs.QuestSyncError(f'В изменённой карте нет события ID {event_id}.')
@@ -185,7 +261,6 @@ def prepare_paths(source, original, modified, objects_ugs=None, *, delete_event_
         title = normalized.texts['events'][i*3].decode('cp1251','replace')
         changes.append(Change(f'delete:{i}',f'Удаление события ID {i+1}: {title}',
                               'Удалить запись и три текста события; обновить ссылки и номера.',deletion=i))
-    expected_errors = (qs.QuestSyncError,st.SavError,ValueError,struct.error)
 
     def build(selected):
         doc = old.clone()
@@ -212,8 +287,9 @@ def prepare_paths(source, original, modified, objects_ugs=None, *, delete_event_
                 encoded.extend((tiles[pos],end-pos-1)); pos=end
             doc.sections['surface']=bytes(encoded)
         plan = qs.analyze_data(source,original,modified,raw,old_bytes,doc.encode(),objects_ugs)
-        # Progressed events are an explicit blocked edit, never a silent no-op.
-        conflicts=[]
+        # Keep progressed events and their texts. Only required object-ID
+        # rebasing belongs to the conversion, never an editor gameplay edit.
+        skipped_progressed=set()
         if plan.modified_progressed:
             am,ad=ar.align_armies(old.records('armies'),doc.records('armies'))
             army_ids={i+1:j+1 for j,i in enumerate(am) if i is not None}
@@ -223,10 +299,15 @@ def prepare_paths(source, original, modified, objects_ugs=None, *, delete_event_
                 rebased=ar.remap_event_army_refs(old_record,{i+1 for i in ad},army_ids)
                 rebased=br.remap_event_building_refs(rebased,{i+1 for i in plan.building_deleted_indices},building_ids)
                 if item.text_changed_in_modified_map or rebased!=doc.records('events')[item.index]:
-                    conflicts.append(item)
-        if conflicts:
-            ids = ', '.join(str(v.event_id) for v in conflicts)
-            raise qs.QuestSyncError(f'События ID {ids} уже затронуты игрой: изменение записи или текста сбросит прогресс.')
+                    skipped_progressed.add(item.event_id)
+                    records=doc.records('events');records[item.index]=rebased
+                    doc.sections['events']=b''.join(records)
+                    doc.texts['events'][item.index*3:item.index*3+3]=old.texts['events'][item.index*3:item.index*3+3]
+        if skipped_progressed:
+            plan=qs.analyze_data(source,original,modified,raw,old_bytes,doc.encode(),objects_ugs)
+        progressed_ids={item.index for item in plan.progressed}
+        skipped_progressed.update(i+1 for i in deletions if i in progressed_ids)
+        deletions=[i for i in deletions if i not in progressed_ids]
         old_armies=old.records('armies'); new_armies=doc.records('armies')
         army_mapping,_=ar.align_armies(old_armies,new_armies)
         for target,source_index in enumerate(army_mapping):
@@ -243,6 +324,7 @@ def prepare_paths(source, original, modified, objects_ugs=None, *, delete_event_
         payload, final_map = es.remove_from_payload(plan,payload,deletions)
         final_relation=es.validate_payload_references(plan,payload,final_map)
         report.update({'deleted_event_ids': [i+1 for i in deletions],
+                       'skipped_progressed_event_ids':sorted(skipped_progressed),
                        'output_event_count':plan.modified_event_count-len(deletions),
                        'event_size_delta':171*(plan.modified_event_count-len(deletions)-plan.event_count),
                        'output_payload_size':len(payload),'output_payload_sha256':st.sha256(payload),
@@ -252,7 +334,10 @@ def prepare_paths(source, original, modified, objects_ugs=None, *, delete_event_
         return plan,payload,report,final_map
 
     # Fatal input/format failures must not be interpreted as skippable edits.
-    baseline = build([])
+    try:
+        baseline = build([])
+    except expected_errors as exc:
+        baseline_failure(exc)
     accepted, rejected = [], []
     result = baseline
     def attempt(batch):
@@ -283,7 +368,14 @@ def prepare_paths(source, original, modified, objects_ugs=None, *, delete_event_
             break
     blocked = [c.blocked(reason) for c,reason in rejected]
     plan,payload,report,final_map = result
+    skipped=set(report['skipped_progressed_event_ids'])
+    accepted=[c for c in accepted if not (
+        (c.key.startswith('events:') and c.key.split(':')[1].isdigit() and int(c.key.split(':')[1])+1 in skipped)
+        or (c.deletion is not None and c.deletion+1 in skipped))]
     report.update({'partial_conversion':bool(blocked),'blocked_changes':blocked,
+                   'baseline_from_json':baseline_used,
+                   'baseline_from_cache':cache_used,
+                   'baseline_warnings':baseline_warnings,
                    'applied_changes':[{'key':c.key,'data':c.label} for c in accepted],
                    'requested_modified_map_sha256':st.sha256(requested_bytes),
                    'requested_deleted_event_ids':sorted({i+1 for i in removed}),
@@ -294,6 +386,37 @@ def prepare_paths(source, original, modified, objects_ugs=None, *, delete_event_
 def save_prepared(prepared, output, *, accept_partial=False, write_report=True, allow_overwrite=False):
     if prepared.blocked and not accept_partial:
         raise qs.QuestSyncError('Есть заблокированные изменения. Подтвердите сохранение без них.')
-    return qs.convert_plan(prepared.plan,output,write_report=write_report,allow_overwrite=allow_overwrite,
-                           prepared_result=(prepared.payload,prepared.report),
-                           save_name=Path(output).stem)
+    output=Path(output)
+    sidecar=output.with_suffix(output.suffix+'.sync.json')
+    previous_report=None
+    if not write_report and sidecar.exists():
+        if not allow_overwrite:
+            raise qs.QuestSyncError(f'Рядом уже существует JSON: {sidecar}. Подтвердите замену результата.')
+        previous_report=st.read_bounded(sidecar,32*1024*1024)
+        old=read_report(previous_report)
+        owned=old.get('conversion_baseline',{}).get('save_sha256') or old.get('output_sha256')
+        if not output.is_file() or owned!=st.sha256(st.read_bounded(output)):
+            raise qs.QuestSyncError('Существующий JSON не относится к заменяемому SAV. Выберите другое имя результата.')
+    report = dict(prepared.report)
+    if write_report:
+        report['conversion_baseline'] = {
+            'format':'dtm-bz2-base64-v1', 'map_sha256':st.sha256(prepared.final_map),
+            'data':base64.b64encode(bz2.compress(prepared.final_map)).decode('ascii'),
+        }
+    result = qs.convert_plan(prepared.plan,output,write_report=write_report,allow_overwrite=allow_overwrite,
+                             prepared_result=(prepared.payload,report),save_name=Path(output).stem)
+    try:
+        conversion_state.write(result['output_sha256'],prepared.final_map)
+        result['baseline_cache_status']='written'
+    except OSError as exc:
+        result['baseline_cache_status']='failed';result['baseline_cache_error']=str(exc)
+    if previous_report is not None:
+        try:
+            if st.read_bounded(sidecar,32*1024*1024)!=previous_report:
+                raise OSError('JSON изменился во время сохранения; он не удалён.')
+            sidecar.unlink()
+            result['removed_previous_report']=True
+        except OSError as exc:
+            result['report_status']='failed';result['report_error']=str(exc)
+    # Compact on-disk JSON must not remove fields used by the GUI/CLI result.
+    return {**prepared.report, **result}

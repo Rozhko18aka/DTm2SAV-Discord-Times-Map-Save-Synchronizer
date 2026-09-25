@@ -1224,6 +1224,8 @@ def validate_decoration_rebuild_safety(
     cell_table_base_u16: int,
     cell_table_stride: int,
     cells: set[tuple[int, int]],
+    released_objects: dict[tuple[int, int, int], int] | None = None,
+    deleted_army_ids: set[int] | None = None,
 ) -> None:
     if not cells:
         return
@@ -1237,11 +1239,34 @@ def validate_decoration_rebuild_safety(
         # a non-zero value there alone does not mean that an object occupies it.
         for field in (1, 2, 3, 4, 6, 7):
             value = struct.unpack_from("<H", values, (cell + field) * 2)[0]
+            if value and (released_objects or {}).get((x,y,field)) == value:
+                continue
+            if value and field in (3,4) and deleted_army_ids:
+                marker,kind=struct.unpack_from('<HH',values,(cell+3)*2)
+                if army_runtime.decode_army_cell_marker(marker,kind) in deleted_army_ids:
+                    continue
             if value:
+                label = {1:'строение',2:'фонарь',3:'армия',4:'маркер объекта'}.get(field,'служебное поле')
                 raise QuestSyncError(
                     f"Нельзя безопасно пересобрать декорации в клетке ({x}, {y}): "
-                    "там находится строение, фонарь или другой служебный объект."
+                    f"остаётся {label} (поле {field}, значение {value}); его удаление или перенос не подтверждены."
                 )
+
+
+def released_decoration_objects(old_buildings, new_buildings, old_lanterns, new_lanterns):
+    """Exact source markers removed by this same conversion transaction.
+
+    Construction later rebuilds building footprints/properties and lantern IDs.
+    Do not release cells occupied by target objects or unknown source values.
+    """
+    released = {}
+    for field, before, after in ((1,old_buildings,new_buildings),(2,old_lanterns,new_lanterns)):
+        occupied = {struct.unpack_from('<HH',r) for r in after}
+        for i,raw in enumerate(before):
+            x,y=struct.unpack_from('<HH',raw)
+            if (x,y) not in occupied:
+                released[(x,y,field)] = i+1 if field==1 else raw[4]
+    return released
 
 
 def prepare_lantern_additions(
@@ -1793,6 +1818,16 @@ def analyze_data(source_sav, original_dtm, modified_dtm, save_raw, original, mod
         modified_sections["decorations"]["end"]
     ]
     decorations_changed = original_decoration_bytes != modified_decoration_bytes
+    released_objects = released_decoration_objects(
+        old_building_records,new_building_records,
+        [_record(original,original_sections['lanterns'],i,LANTERN_SIZE) for i in range(lantern_count)],
+        [_record(modified,modified_sections['lanterns'],i,LANTERN_SIZE) for i in range(modified_sections['lanterns']['count'])],
+    )
+    _, removed_army_indices = army_runtime.align_armies(
+        _army_records(original,original_sections['armies']),
+        _army_records(modified,modified_sections['armies']),
+    )
+    deleted_army_ids = {i+1 for i in removed_army_indices}
     if decorations_changed or terrain_changes or building_grid_semantics_changed:
         resolved_objects_ugs = locate_objects_ugs(
             objects_ugs,
@@ -1823,6 +1858,7 @@ def analyze_data(source_sav, original_dtm, modified_dtm, save_raw, original, mod
             cell_table_base_u16,
             cell_table_stride,
             decoration_rebuild_cells,
+            released_objects, deleted_army_ids,
         )
     if terrain_changes:
         terrain_cells = {(item.x, item.y) for item in terrain_changes}
@@ -1837,6 +1873,7 @@ def analyze_data(source_sav, original_dtm, modified_dtm, save_raw, original, mod
             cell_table_base_u16,
             cell_table_stride,
             terrain_cells,
+            released_objects, deleted_army_ids,
         )
         modified_decorations = _parse_decorations(
             modified,
@@ -2214,6 +2251,7 @@ def build_synced_payload(plan: SyncPlan) -> tuple[bytes, dict[str, Any]]:
         item: DecorationAtlasRecord,
         tile_id: int,
         grid_number: int,
+        reconstructed: bool = False,
     ) -> int:
         expected_values = (
             PROPERTY_A_BASE_VALUES
@@ -2224,19 +2262,26 @@ def build_synced_payload(plan: SyncPlan) -> tuple[bytes, dict[str, Any]]:
         ).get(tile_id, frozenset())
         if (plan.width, plan.height) == (50, 50):
             expected_values = frozenset(((property_a_base, property_b_base, property_c_base)[grid_number][tile_id],))
-        if value not in expected_values:
+        base = (property_a_base, property_b_base, property_c_base)[grid_number][tile_id]
+        # Recognize costs contributed by an earlier overlapping decoration.
+        # Impassability dominates; passable overlays add their terrain cost.
+        increments = (2,3,4,6) if base <= 8 else (10,15,20,30)
+        expected_values = expected_values | {base+step for step in increments}
+        if value == 0:
+            return 0
+        if not reconstructed and value not in expected_values:
             return value
         if not item.passable:
             return 0
         if item.is_tree:
-            if value <= 2:
+            if base <= 2:
                 return 0
             if item.kind == 10:
-                return min(65535, value + (6 if value <= 8 else 30))
-            return min(65535, value + (4 if value <= 8 else 20))
+                return min(65535, value + (6 if base <= 8 else 30))
+            return min(65535, value + (4 if base <= 8 else 20))
         if item.kind == 4:
-            return min(65535, value + (3 if value <= 8 else 15))
-        return min(65535, value + (2 if value <= 8 else 10))
+            return min(65535, value + (3 if base <= 8 else 15))
+        return min(65535, value + (2 if base <= 8 else 10))
 
     def blend_visual(value: int, item: DecorationAtlasRecord) -> int:
         base = (value >> 11 & 31, value >> 5 & 63, value & 31)
@@ -2466,10 +2511,13 @@ def build_synced_payload(plan: SyncPlan) -> tuple[bytes, dict[str, Any]]:
         for x, y in sorted(reset_cells):
             tile_id = surface[x + plan.width * y]
             for grid_number, bases in (
+                (-1, property_c_base),
                 (0, property_a_base),
                 (1, property_b_base),
             ):
                 index = terrain_property_index(grid_number, x, y)
+                if index < 0:
+                    continue
                 before = grid_u16(index)
                 after = bases[tile_id]
                 if after != before:
@@ -2522,10 +2570,14 @@ def build_synced_payload(plan: SyncPlan) -> tuple[bytes, dict[str, Any]]:
                         )
                         for grid_number, property_kind in ((0, 0), (1, 1))
                     ]
+                    c_index = terrain_property_index(-1,x,y)
+                    if c_index >= 0:
+                        property_grids.append((c_index,2))
                 for index, property_kind in property_grids:
                     before = grid_u16(index)
                     after = update_property(
-                        before, item.atlas, tile_id, property_kind
+                        before, item.atlas, tile_id, property_kind,
+                        reconstructed=rebuilding or terrain_reapply,
                     )
                     if after != before:
                         set_grid_u16(index, after)
@@ -2630,7 +2682,7 @@ def build_synced_payload(plan: SyncPlan) -> tuple[bytes, dict[str, Any]]:
                     if index < 0:
                         continue
                     before = grid_u16(index)
-                    after = update_property(before, item.atlas, tile_id, property_kind)
+                    after = update_property(before, item.atlas, tile_id, property_kind,reconstructed=True)
                     if after != before:
                         set_grid_u16(index, after)
                         building_property_writes += 1
@@ -3047,6 +3099,7 @@ def convert_plan(
     output_sav = Path(output_sav)
     report_path = output_sav.with_suffix(output_sav.suffix + '.sync.json')
     protected = [Path(plan.source_sav), Path(plan.original_dtm), Path(plan.modified_dtm)]
+    protected.append(Path(plan.source_sav).with_suffix(Path(plan.source_sav).suffix+'.sync.json'))
     if getattr(plan, 'objects_ugs', None) is not None:
         protected.append(Path(plan.objects_ugs))
     protected.extend(Path(p) for p in army_runtime.load_catalog().get('_game_data', {}).get('files', {}).values())
@@ -3090,6 +3143,8 @@ def convert_plan(
             "report_status": "written" if write_report else "disabled",
         }
     )
+    if 'conversion_baseline' in report:
+        report['conversion_baseline'] = dict(report['conversion_baseline'],save_sha256=sav_tool.sha256(packed))
     # Serialize before committing the SAV: a JSON error must not leave a
     # successful save disguised as a failed conversion.
     report_bytes = (json.dumps(report, ensure_ascii=False, indent=2) + '\n').encode('utf-8') if write_report else None
@@ -3161,7 +3216,7 @@ def build_parser() -> argparse.ArgumentParser:
         else:
             p.add_argument("--output", type=Path, required=True, help="new SAV")
             p.add_argument("--overwrite", action="store_true")
-            p.add_argument("--no-report", action="store_true")
+            p.add_argument("--no-report", action="store_true", help="do not write JSON; repeat-conversion state stays in the local application cache")
             p.add_argument('--skip-blocked', action='store_true', help='explicitly accept the verified partial result')
             p.set_defaults(func=command_convert)
     return parser

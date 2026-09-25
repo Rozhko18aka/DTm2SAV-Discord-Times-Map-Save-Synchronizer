@@ -1,6 +1,2 @@
-DTm2SAV v6.5 - army cell-index lifecycle fix and save naming
-Date: 2026-09-24
-Validation: 181 tests passed; native input fixtures, GUI and CLI controls PASS.
-Python: 3.13; game load/battle not exercised.
-See CHANGES_v6.5_RU.md for current instructions and limitations.
-Historical validation files describe earlier versions.
+DTm2SAV v6.9.2 - readable DTm diagnostics
+219 tests PASS; Tk GUI PASS. Game load not exercised. See CHANGES_v6.9.2_RU.md.
